@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('fDesktop', {
   savePdfDialog: (defaultName, bytes) =>
     ipcRenderer.invoke('dialog:savePdf', { defaultName, bytes }),
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
+  onFileOpened: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('file:opened', handler);
+    return () => ipcRenderer.removeListener('file:opened', handler);
+  },
   yousign: {
     getConfig: () => ipcRenderer.invoke('yousign:getConfig'),
     saveConfig: (cfg) => ipcRenderer.invoke('yousign:saveConfig', cfg),

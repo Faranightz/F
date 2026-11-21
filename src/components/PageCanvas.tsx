@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type * as pdfjsLib from 'pdfjs-dist';
-import { GripHorizontal, Trash2 } from 'lucide-react';
+import { GripHorizontal, ShieldCheck, Trash2 } from 'lucide-react';
 import type {
   ActiveTool,
   HeaderFooterConfig,
@@ -8,6 +8,7 @@ import type {
   Point,
   StampPreset,
   WatermarkConfig,
+  YousignPlacedZone,
 } from '../types/pdf';
 
 interface PageCanvasProps {
@@ -31,6 +32,7 @@ interface PageCanvasProps {
   onAddOverlay: (item: OverlayItem) => void;
   onUpdateOverlay: (id: string, patch: Partial<OverlayItem>) => void;
   onDeleteOverlay: (id: string) => void;
+  onYousignZonePlaced?: (zone: YousignPlacedZone) => void;
   onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
 }
 
@@ -55,14 +57,19 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
   onAddOverlay,
   onUpdateOverlay,
   onDeleteOverlay,
+  onYousignZonePlaced,
   onCanvasReady,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onCanvasReadyRef = useRef(onCanvasReady);
-  onCanvasReadyRef.current = onCanvasReady;
+
+  useEffect(() => {
+    onCanvasReadyRef.current = onCanvasReady;
+  }, [onCanvasReady]);
 
   const [pageSize, setPageSize] = useState({ width: 595, height: 842 });
+  const [basePagePts, setBasePagePts] = useState({ width: 595, height: 842 });
   const [draftItem, setDraftItem] = useState<OverlayItem | null>(null);
 
   const interactionRef = useRef<
@@ -73,6 +80,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
         startY: number;
         origX: number;
         origY: number;
+        origPoints?: Point[];
       }
     | {
         mode: 'resize';
@@ -85,7 +93,6 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     | null
   >(null);
 
-  // Render PDF page ONLY when pdfDoc, pageNumber, or zoom changes (no render loop!)
   useEffect(() => {
     let cancelled = false;
     let renderTask: pdfjsLib.RenderTask | null = null;
@@ -96,6 +103,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
       const page = await pdfDoc.getPage(safePage);
       if (cancelled) return;
 
+      const baseVp = page.getViewport({ scale: 1 });
       const viewport = page.getViewport({ scale: zoom });
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const canvas = canvasRef.current;
@@ -107,6 +115,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
       setPageSize({ width: viewport.width, height: viewport.height });
+      setBasePagePts({ width: baseVp.width, height: baseVp.height });
 
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       renderTask = page.render({ canvasContext: ctx, viewport, canvas });
@@ -284,7 +293,36 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
       return;
     }
 
-    // Drag-to-create vector tools
+    if (activeTool === 'yousign-zone') {
+      const w = 0.32;
+      const h = 0.075;
+      const x = Math.max(0, Math.min(1 - w, pt.x - w / 2));
+      const y = Math.max(0, Math.min(1 - h, pt.y - h / 2));
+      const item: OverlayItem = {
+        id: crypto.randomUUID(),
+        pageIndex,
+        kind: 'yousign-zone',
+        x,
+        y,
+        w,
+        h,
+        color: '#0f766e',
+        text: 'Zone Signature Yousign',
+        createdAt: now,
+      };
+      onAddOverlay(item);
+      onSelectOverlay(item.id);
+      onYousignZonePlaced?.({
+        page: pageNumber,
+        x: Math.round(x * basePagePts.width),
+        y: Math.round(y * basePagePts.height),
+        width: Math.max(80, Math.round(w * basePagePts.width)),
+        height: Math.max(40, Math.round(h * basePagePts.height)),
+      });
+      return;
+    }
+
+    // Drag-to-create tools: highlight, draw, rect, ellipse, arrow, redact
     e.currentTarget.setPointerCapture(e.pointerId);
     const id = crypto.randomUUID();
     if (activeTool === 'draw' || activeTool === 'arrow') {
@@ -304,7 +342,8 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     } else if (
       activeTool === 'highlight' ||
       activeTool === 'rect' ||
-      activeTool === 'ellipse'
+      activeTool === 'ellipse' ||
+      activeTool === 'redact'
     ) {
       setDraftItem({
         id,
@@ -314,7 +353,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
         y: pt.y,
         w: 0.001,
         h: 0.001,
-        color: toolColor,
+        color: activeTool === 'redact' ? '#000000' : toolColor,
         strokeWidth,
         opacity: activeTool === 'highlight' ? 0.36 : 1,
         createdAt: now,
@@ -327,10 +366,21 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     if (active) {
       const pt = toNormalized(e.clientX, e.clientY);
       if (active.mode === 'move') {
-        onUpdateOverlay(active.id, {
-          x: Math.max(0, Math.min(0.96, active.origX + (pt.x - active.startX))),
-          y: Math.max(0, Math.min(0.96, active.origY + (pt.y - active.startY))),
-        });
+        const dx = pt.x - active.startX;
+        const dy = pt.y - active.startY;
+        if (active.origPoints) {
+          onUpdateOverlay(active.id, {
+            points: active.origPoints.map((p) => ({
+              x: Math.max(0, Math.min(1, p.x + dx)),
+              y: Math.max(0, Math.min(1, p.y + dy)),
+            })),
+          });
+        } else {
+          onUpdateOverlay(active.id, {
+            x: Math.max(0, Math.min(0.96, active.origX + dx)),
+            y: Math.max(0, Math.min(0.96, active.origY + dy)),
+          });
+        }
       } else if (active.mode === 'resize') {
         onUpdateOverlay(active.id, {
           w: Math.max(0.03, Math.min(0.95, active.origW + (pt.x - active.startX))),
@@ -357,7 +407,10 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     }
   };
 
-  const handleStagePointerUp = () => {
+  const handleStagePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (containerRef.current?.hasPointerCapture(e.pointerId)) {
+      containerRef.current.releasePointerCapture(e.pointerId);
+    }
     if (interactionRef.current) {
       interactionRef.current = null;
       return;
@@ -367,7 +420,8 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     if (
       finalItem.kind === 'highlight' ||
       finalItem.kind === 'rect' ||
-      finalItem.kind === 'ellipse'
+      finalItem.kind === 'ellipse' ||
+      finalItem.kind === 'redact'
     ) {
       const nx = finalItem.w < 0 ? finalItem.x + finalItem.w : finalItem.x;
       const ny = finalItem.h < 0 ? finalItem.y + finalItem.h : finalItem.y;
@@ -398,11 +452,16 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     const targetTag = (e.target as HTMLElement)?.tagName;
     if (!forceHandle && (targetTag === 'TEXTAREA' || targetTag === 'INPUT')) {
       onSelectOverlay(item.id);
-      return; // Allow normal text selection/editing inside inputs
+      return;
     }
     e.stopPropagation();
     onSelectOverlay(item.id);
     onBeforeMutate();
+    try {
+      containerRef.current?.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore if capture unsupported
+    }
     const pt = toNormalized(e.clientX, e.clientY);
     interactionRef.current = {
       mode: 'move',
@@ -411,6 +470,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
       startY: pt.y,
       origX: item.x,
       origY: item.y,
+      origPoints: item.points ? item.points.map((p) => ({ ...p })) : undefined,
     };
   };
 
@@ -418,6 +478,11 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     e.stopPropagation();
     onSelectOverlay(item.id);
     onBeforeMutate();
+    try {
+      containerRef.current?.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
     const pt = toNormalized(e.clientX, e.clientY);
     interactionRef.current = {
       mode: 'resize',
@@ -430,12 +495,32 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
   };
 
   const pageOverlays = overlays.filter((o) => o.pageIndex === pageNumber - 1);
+  const svgKinds = ['highlight', 'draw', 'rect', 'ellipse', 'arrow', 'redact'];
   const allSvgItems = [
-    ...pageOverlays.filter((o) =>
-      ['highlight', 'draw', 'rect', 'ellipse', 'arrow'].includes(o.kind)
-    ),
+    ...pageOverlays.filter((o) => svgKinds.includes(o.kind)),
     ...(draftItem ? [draftItem] : []),
   ];
+
+  // Compute floating delete button position for selected SVG overlay
+  const selectedSvgItem = pageOverlays.find(
+    (o) => o.id === selectedId && svgKinds.includes(o.kind)
+  );
+  let selectedSvgDeletePos: { left: number; top: number } | null = null;
+  if (selectedSvgItem) {
+    if (selectedSvgItem.points && selectedSvgItem.points.length > 0) {
+      const maxX = Math.max(...selectedSvgItem.points.map((p) => p.x));
+      const minY = Math.min(...selectedSvgItem.points.map((p) => p.y));
+      selectedSvgDeletePos = {
+        left: Math.min(pageSize.width - 12, maxX * pageSize.width),
+        top: Math.max(12, minY * pageSize.height),
+      };
+    } else {
+      selectedSvgDeletePos = {
+        left: Math.min(pageSize.width - 12, (selectedSvgItem.x + selectedSvgItem.w) * pageSize.width),
+        top: Math.max(12, selectedSvgItem.y * pageSize.height),
+      };
+    }
+  }
 
   const formatMeta = (tpl: string) =>
     tpl
@@ -460,7 +545,6 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     >
       <canvas ref={canvasRef} className="pdf-render-canvas" />
 
-      {/* Live Watermark preview */}
       {watermark.enabled && watermark.text.trim() && (
         <div
           className="pdf-watermark-preview"
@@ -475,7 +559,6 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
         </div>
       )}
 
-      {/* Live Header / Footer preview */}
       {headerFooter.enabled && (
         <>
           <div className="pdf-hf-bar pdf-hf-top">
@@ -516,6 +599,26 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
           const nh = Math.abs(item.h) * pageSize.height;
           const px = nx * pageSize.width;
           const py = ny * pageSize.height;
+
+          if (item.kind === 'redact') {
+            return (
+              <rect
+                key={item.id}
+                x={px}
+                y={py}
+                width={nw}
+                height={nh}
+                fill="#000000"
+                stroke={isSelected ? '#c2410c' : 'none'}
+                strokeWidth={isSelected ? 2 : 0}
+                style={{
+                  pointerEvents: activeTool === 'select' ? 'all' : 'none',
+                  cursor: activeTool === 'select' ? 'move' : 'default',
+                }}
+                onPointerDown={(e) => startMoveOverlay(e, item, true)}
+              />
+            );
+          }
 
           if (item.kind === 'highlight') {
             return (
@@ -593,14 +696,15 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                 d={d}
                 fill="none"
                 stroke={item.color}
-                strokeWidth={(item.strokeWidth ?? 2.2) * zoom}
+                strokeWidth={((item.strokeWidth ?? 2.2) + (isSelected ? 1.2 : 0)) * zoom}
+                strokeDasharray={isSelected ? '6 3' : undefined}
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                style={{ pointerEvents: activeTool === 'select' ? 'stroke' : 'none' }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onSelectOverlay(item.id);
+                style={{
+                  pointerEvents: activeTool === 'select' ? 'stroke' : 'none',
+                  cursor: activeTool === 'select' ? 'move' : 'default',
                 }}
+                onPointerDown={(e) => startMoveOverlay(e, item, true)}
               />
             );
           }
@@ -616,13 +720,14 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                 x2={p1.x * pageSize.width}
                 y2={p1.y * pageSize.height}
                 stroke={item.color}
-                strokeWidth={(item.strokeWidth ?? 2.2) * zoom}
+                strokeWidth={((item.strokeWidth ?? 2.2) + (isSelected ? 1.2 : 0)) * zoom}
+                strokeDasharray={isSelected ? '6 3' : undefined}
                 markerEnd="url(#f-arrowhead)"
-                style={{ pointerEvents: activeTool === 'select' ? 'stroke' : 'none' }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onSelectOverlay(item.id);
+                style={{
+                  pointerEvents: activeTool === 'select' ? 'stroke' : 'none',
+                  cursor: activeTool === 'select' ? 'move' : 'default',
                 }}
+                onPointerDown={(e) => startMoveOverlay(e, item, true)}
               />
             );
           }
@@ -630,11 +735,30 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
         })}
       </svg>
 
+      {/* Floating delete button for selected SVG overlay */}
+      {selectedSvgItem && selectedSvgDeletePos && (
+        <button
+          type="button"
+          className="overlay-delete-pill"
+          style={{
+            left: selectedSvgDeletePos.left - 11,
+            top: selectedSvgDeletePos.top - 11,
+            right: 'auto',
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDeleteOverlay(selectedSvgItem.id);
+          }}
+          title="Supprimer la forme sélectionnée"
+          aria-label="Supprimer la forme sélectionnée"
+        >
+          <Trash2 size={12} />
+        </button>
+      )}
+
       {/* Interactive HTML Layer */}
       {pageOverlays
-        .filter(
-          (o) => !['highlight', 'draw', 'rect', 'ellipse', 'arrow'].includes(o.kind)
-        )
+        .filter((o) => !svgKinds.includes(o.kind))
         .map((item) => {
           const isSelected = item.id === selectedId;
           const style: React.CSSProperties = {
@@ -701,6 +825,19 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                 />
               )}
 
+              {item.kind === 'ocr-layer' && (
+                <div className="overlay-ocr-pill" title="Couche texte OCR invisible injectée à l’export PDF">
+                  Couche OCR invisible active ({(item.text || '').length} car.)
+                </div>
+              )}
+
+              {item.kind === 'yousign-zone' && (
+                <div className="overlay-yousign-zone">
+                  <ShieldCheck size={14} />
+                  <span>Zone Yousign (p.{pageNumber})</span>
+                </div>
+              )}
+
               {item.kind === 'note' && (
                 <div className="overlay-sticky-note">
                   <div
@@ -741,7 +878,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                 <input
                   type="text"
                   className="overlay-form-input"
-                  placeholder="Champ texte…"
+                  placeholder="Champ texte AcroForm…"
                   aria-label="Champ de formulaire texte"
                   value={item.text || ''}
                   onFocus={onBeforeMutate}

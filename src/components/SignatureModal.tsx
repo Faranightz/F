@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Check, Eraser, PenTool, Type, Upload, X } from 'lucide-react';
 import type { SavedSignature } from '../types/pdf';
+import { normalizeImageFileToDataUrl } from '../utils/pdfEngine';
 
 const MAX_SIG_IMAGE_BYTES = 2 * 1024 * 1024; // 2 MB
 
@@ -43,7 +44,6 @@ export const SignatureModal: React.FC<SignatureModalProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    setHasStroke(false);
   }, [isOpen, mode]);
 
   if (!isOpen) return null;
@@ -101,6 +101,7 @@ export const SignatureModal: React.FC<SignatureModalProps> = ({
     const canvas = canvasRef.current;
     if (!canvas || !hasStroke) return;
     onSelectSignature(canvas.toDataURL('image/png'), 'Signature manuscrite');
+    setHasStroke(false);
     onClose();
   };
 
@@ -120,22 +121,24 @@ export const SignatureModal: React.FC<SignatureModalProps> = ({
     onClose();
   };
 
-  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     setUploadError(null);
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.size > MAX_SIG_IMAGE_BYTES) {
       setUploadError('L’image dépasse 2 Mo. Veuillez choisir un fichier plus léger.');
+      e.target.value = '';
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onSelectSignature(reader.result, file.name);
-        onClose();
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const safeDataUrl = await normalizeImageFileToDataUrl(file);
+      onSelectSignature(safeDataUrl, file.name);
+      onClose();
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Format image non supporté.');
+    } finally {
+      e.target.value = '';
+    }
   };
 
   return (
@@ -162,7 +165,10 @@ export const SignatureModal: React.FC<SignatureModalProps> = ({
             role="tab"
             aria-selected={mode === 'draw'}
             className={`modal-tab ${mode === 'draw' ? 'active' : ''}`}
-            onClick={() => setMode('draw')}
+            onClick={() => {
+              setMode('draw');
+              setHasStroke(false);
+            }}
           >
             <PenTool size={14} /> Dessiner
           </button>
@@ -256,8 +262,8 @@ export const SignatureModal: React.FC<SignatureModalProps> = ({
           {mode === 'upload' && (
             <label className="upload-dropzone">
               <Upload size={26} />
-              <span>Cliquez pour importer une image PNG ou JPG (max 2 Mo)</span>
-              <input type="file" accept="image/png,image/jpeg" hidden onChange={handleUpload} />
+              <span>Cliquez pour importer une image PNG / JPG / WebP (max 2 Mo)</span>
+              <input type="file" accept="image/*" hidden onChange={handleUpload} />
             </label>
           )}
 

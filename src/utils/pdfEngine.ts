@@ -11,6 +11,7 @@ import type {
   HeaderFooterConfig,
   OutlineEntry,
   OverlayItem,
+  Point,
   SearchMatch,
   WatermarkConfig,
 } from '../types/pdf';
@@ -18,7 +19,7 @@ import type {
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
 // Safe WinAnsi encoder: preserves all French/European WinAnsi characters (éèêëàâäîïôöùûüçœŒ€«»’—–…)
-// and replaces unsupported Unicode symbols (e.g. ligatures, emojis, arrows from OCR) without crashing pdf-lib.
+// and replaces unsupported Unicode symbols without crashing pdf-lib.
 const WINANSI_EXTENDED = new Set([
   0x20ac, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030,
   0x0160, 0x2039, 0x0152, 0x017d, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
@@ -50,7 +51,6 @@ export function toWinAnsiSafe(input: string): string {
     ) {
       out += ch;
     } else {
-      // Fallback: strip diacritics if Latin-extended, otherwise omit safely
       const stripped = ch.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
       if (stripped && stripped.charCodeAt(0) >= 0x20 && stripped.charCodeAt(0) <= 0x7e) {
         out += stripped;
@@ -75,6 +75,45 @@ function decodeSafeImageDataUrl(
     bytes[i] = binary.charCodeAt(i);
   }
   return { format, bytes };
+}
+
+/**
+ * Ensures any uploaded image (PNG, JPEG, WebP, GIF, BMP) is converted to a safe
+ * data:image/png;base64 or data:image/jpeg;base64 URL so it never silently fails on PDF export.
+ */
+export async function normalizeImageFileToDataUrl(file: File): Promise<string> {
+  if (file.type === 'image/png' || file.type === 'image/jpeg') {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () =>
+        typeof reader.result === 'string'
+          ? resolve(reader.result)
+          : reject(new Error('Lecture image impossible.'));
+      reader.onerror = () => reject(new Error('Erreur de lecture du fichier image.'));
+      reader.readAsDataURL(file);
+    });
+  }
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Format non pris en charge. Choisissez une image PNG ou JPEG.');
+  }
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('Image corrompue ou non supportée.'));
+      el.src = objectUrl;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth || 400;
+    canvas.height = img.naturalHeight || 200;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Contexte canvas indisponible.');
+    ctx.drawImage(img, 0, 0);
+    return canvas.toDataURL('image/png');
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
 function hexToRgbTuple(hex: string): [number, number, number] {
@@ -133,6 +172,40 @@ function visualRectToPdfBox(
   return { x, y, w, h };
 }
 
+/**
+ * Rotate existing normalized overlays on a page when the user rotates that page (±90°).
+ */
+export function rotateOverlaysForPage(
+  overlays: OverlayItem[],
+  pageIndex: number,
+  deltaDegrees: number
+): OverlayItem[] {
+  const d = ((deltaDegrees % 360) + 360) % 360;
+  if (d === 0) return overlays;
+
+  const rotPt = (p: Point): Point => {
+    if (d === 90) return { x: 1 - p.y, y: p.x };
+    if (d === 270) return { x: p.y, y: 1 - p.x };
+    if (d === 180) return { x: 1 - p.x, y: 1 - p.y };
+    return p;
+  };
+
+  return overlays.map((item) => {
+    if (item.pageIndex !== pageIndex) return item;
+    const pts = item.points ? item.points.map(rotPt) : undefined;
+    const c1 = rotPt({ x: item.x, y: item.y });
+    const c2 = rotPt({ x: item.x + item.w, y: item.y + item.h });
+    return {
+      ...item,
+      x: Math.min(c1.x, c2.x),
+      y: Math.min(c1.y, c2.y),
+      w: Math.abs(c2.x - c1.x),
+      h: Math.abs(c2.y - c1.y),
+      points: pts,
+    };
+  });
+}
+
 export async function createSamplePdf(): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.create();
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
@@ -179,12 +252,12 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     'Ce document de démonstration multi-pages vous permet de tester immédiatement',
     'toutes les fonctionnalités de F directement depuis le ruban :',
     '',
-    '  • Onglet Accueil : zoom fluide, main (pan), rotation, recherche plein texte.',
+    '  • Onglet Accueil : zoom Ctrl+Molette, main (pan), rotation, recherche plein texte.',
     '  • Onglet Commentaire : surlignage, stylo, formes, notes adhésives, tampons.',
-    '  • Onglet Éditer : blocs de texte, images, filigrane, en-têtes & pieds de page.',
+    '  • Onglet Éditer : texte, images, caviardage, filigrane, en-têtes & purge métadonnées.',
     '  • Onglet Organiser : fusionner, diviser, extraire, pivoter, réordonner les pages.',
-    '  • Onglet Formulaire & Signer : champs texte, cases, signature & Yousign eIDAS.',
-    '  • Onglet Convertir & OCR : reconnaissance de texte (FR/EN) et export PNG/JPEG/TXT.',
+    '  • Onglet Formulaire & Signer : AcroForm natifs, signature locale & Yousign eIDAS.',
+    '  • Onglet Convertir & OCR : OCR local + couche texte invisible et export PNG/JPEG/TXT.',
   ];
   for (const line of lines1) {
     p1.drawText(toWinAnsiSafe(line), {
@@ -214,7 +287,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     color: rgb(0.76, 0.25, 0.05),
   });
   p1.drawText(
-    'Cliquez sur « Enregistrer PDF » (ou Ctrl+S) pour exporter ce document avec toutes vos',
+    'Glissez-déposez un fichier .pdf dans la fenêtre ou utilisez Ctrl+S pour enregistrer',
     {
       x: 64,
       y: y - 54,
@@ -224,7 +297,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     }
   );
   p1.drawText(
-    'annotations, signatures, filigranes et champs de formulaire intégrés nativement.',
+    'avec vos champs AcroForm interactifs, caviardages, signatures et couche OCR.',
     {
       x: 64,
       y: y - 70,
@@ -236,7 +309,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
 
   // Page 2
   const p2 = pdfDoc.addPage(PageSizes.A4);
-  p2.drawText('2. Zone de test : Contrat, Formulaire & Signature Yousign', {
+  p2.drawText('2. Zone de test : Contrat, Formulaire AcroForm & Yousign', {
     x: 48,
     y: height - 64,
     size: 15,
@@ -293,8 +366,8 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     borderWidth: 1,
     color: rgb(0.99, 0.99, 0.99),
   });
-  p2.drawText('Zone de signature manuscrite', {
-    x: 92,
+  p2.drawText('Zone de signature (locale ou Yousign)', {
+    x: 76,
     y: fy - 125,
     size: 9.5,
     font: helvetica,
@@ -338,7 +411,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     }
   );
   p3.drawText(
-    'des documents PDF. Utilisez l’onglet Convertir & OCR pour extraire le texte d’une page.',
+    'des documents PDF. L’onglet Convertir & OCR utilise un moteur WASM local sécurisé.',
     {
       x: 48,
       y: height - 122,
@@ -351,10 +424,10 @@ export async function createSamplePdf(): Promise<Uint8Array> {
   const rows = [
     ['Module', 'Moteur utilisé', 'Statut'],
     ['Rendu & Zoom HiDPI', 'PDF.js (Web Worker local)', 'Actif'],
-    ['Édition & Export PDF', 'pdf-lib (écriture native)', 'Actif'],
+    ['Édition, AcroForm & Caviardage', 'pdf-lib (natif)', 'Actif'],
     ['Signature eIDAS', 'Yousign API v3 (DPAPI / Démo)', 'Actif'],
-    ['OCR (FR / EN)', 'Tesseract.js (WASM)', 'Actif'],
-    ['Build Windows (.exe)', 'Electron + electron-builder', 'Prêt'],
+    ['OCR (FR / EN)', 'Tesseract.js (worker/WASM local)', 'Actif'],
+    ['Build Windows (.exe)', 'Electron + icône + .pdf', 'Prêt'],
   ];
   let ty = height - 175;
   rows.forEach((row, idx) => {
@@ -374,9 +447,9 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     });
     const textColor = idx === 0 ? rgb(1, 1, 1) : rgb(0.18, 0.21, 0.25);
     const font = idx === 0 ? helveticaBold : helvetica;
-    p3.drawText(toWinAnsiSafe(row[0]), { x: 60, y: ty + 2, size: 10.5, font, color: textColor });
-    p3.drawText(toWinAnsiSafe(row[1]), { x: 225, y: ty + 2, size: 10.5, font, color: textColor });
-    p3.drawText(toWinAnsiSafe(row[2]), { x: 465, y: ty + 2, size: 10.5, font, color: textColor });
+    p3.drawText(toWinAnsiSafe(row[0]), { x: 58, y: ty + 2, size: 10, font, color: textColor });
+    p3.drawText(toWinAnsiSafe(row[1]), { x: 240, y: ty + 2, size: 10, font, color: textColor });
+    p3.drawText(toWinAnsiSafe(row[2]), { x: 465, y: ty + 2, size: 10, font, color: textColor });
     ty -= 28;
   });
 
@@ -492,26 +565,40 @@ export async function bakeEditsToPdf(
   sourceBytes: Uint8Array,
   overlays: OverlayItem[],
   watermark: WatermarkConfig,
-  headerFooter: HeaderFooterConfig
+  headerFooter: HeaderFooterConfig,
+  purgeMetadata = false
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(sourceBytes);
   const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const form = pdfDoc.getForm();
   const pages = pdfDoc.getPages();
   const totalPages = pages.length;
+
+  if (purgeMetadata) {
+    pdfDoc.setTitle('');
+    pdfDoc.setAuthor('');
+    pdfDoc.setSubject('');
+    pdfDoc.setKeywords([]);
+    pdfDoc.setCreator('');
+    pdfDoc.setProducer('');
+  }
+
+  let fieldCounter = 0;
 
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
     const page = pages[pageIndex];
     const { width, height } = page.getSize();
     const rotDeg = ((page.getRotation().angle % 360) + 360) % 360;
 
-    // 1. Watermark (centered consistently with preview)
+    // 1. Watermark (rotation-aware centering)
     if (watermark.enabled && watermark.text.trim()) {
       const [r, g, b] = hexToRgbTuple(watermark.color);
       const wmText = toWinAnsiSafe(watermark.text);
       const wmSize = watermark.fontSize || 48;
       const textWidth = helveticaBold.widthOfTextAtSize(wmText, wmSize);
-      const rad = ((watermark.angle || 45) * Math.PI) / 180;
+      const totalAngleDeg = (watermark.angle || 45) + rotDeg;
+      const rad = (totalAngleDeg * Math.PI) / 180;
       const cx = width / 2;
       const cy = height / 2;
       page.drawText(wmText, {
@@ -521,11 +608,11 @@ export async function bakeEditsToPdf(
         font: helveticaBold,
         color: rgb(r, g, b),
         opacity: Math.max(0.05, Math.min(1, watermark.opacity)),
-        rotate: degrees((watermark.angle || 45) + rotDeg),
+        rotate: degrees(totalAngleDeg),
       });
     }
 
-    // 2. Header & Footer
+    // 2. Header & Footer (rotation-aware)
     if (headerFooter.enabled) {
       const format = (tpl: string) =>
         toWinAnsiSafe(
@@ -534,56 +621,94 @@ export async function bakeEditsToPdf(
             .replace(/\{total\}/gi, String(totalPages))
         );
       const metaColor = rgb(0.35, 0.38, 0.42);
+      const rotOpt = rotDeg ? { rotate: degrees(rotDeg) } : {};
       if (headerFooter.headerLeft) {
+        const pt = visualToPdfCoords(0.05, 0.03, width, height, rotDeg);
         page.drawText(format(headerFooter.headerLeft), {
-          x: 36,
-          y: height - 24,
+          x: pt.x,
+          y: pt.y,
           size: 9,
           font: helvetica,
           color: metaColor,
+          ...rotOpt,
         });
       }
       if (headerFooter.headerRight) {
-        const txt = format(headerFooter.headerRight);
-        const tw = helvetica.widthOfTextAtSize(txt, 9);
-        page.drawText(txt, {
-          x: Math.max(36, width - 36 - tw),
-          y: height - 24,
+        const pt = visualToPdfCoords(0.75, 0.03, width, height, rotDeg);
+        page.drawText(format(headerFooter.headerRight), {
+          x: pt.x,
+          y: pt.y,
           size: 9,
           font: helvetica,
           color: metaColor,
+          ...rotOpt,
         });
       }
       if (headerFooter.footerLeft) {
+        const pt = visualToPdfCoords(0.05, 0.97, width, height, rotDeg);
         page.drawText(format(headerFooter.footerLeft), {
-          x: 36,
-          y: 18,
+          x: pt.x,
+          y: pt.y,
           size: 9,
           font: helvetica,
           color: metaColor,
+          ...rotOpt,
         });
       }
       if (headerFooter.footerRight) {
-        const txt = format(headerFooter.footerRight);
-        const tw = helvetica.widthOfTextAtSize(txt, 9);
-        page.drawText(txt, {
-          x: Math.max(36, width - 36 - tw),
-          y: 18,
+        const pt = visualToPdfCoords(0.78, 0.97, width, height, rotDeg);
+        page.drawText(format(headerFooter.footerRight), {
+          x: pt.x,
+          y: pt.y,
           size: 9,
           font: helvetica,
           color: metaColor,
+          ...rotOpt,
         });
       }
     }
 
-    // 3. Page Overlays (rotation-aware)
+    // 3. Page Overlays
     const pageOverlays = overlays.filter((o) => o.pageIndex === pageIndex);
     for (const item of pageOverlays) {
+      // Visual-only Yousign placement guide is not baked into the PDF document
+      if (item.kind === 'yousign-zone') continue;
+
       const [r, g, b] = hexToRgbTuple(item.color || '#c2410c');
       const box = visualRectToPdfBox(item.x, item.y, item.w, item.h, width, height, rotDeg);
       const { x: px, y: py, w: pw, h: ph } = box;
+      const rotOpt = rotDeg ? { rotate: degrees(rotDeg) } : {};
 
-      if (item.kind === 'highlight') {
+      if (item.kind === 'redact') {
+        page.drawRectangle({
+          x: px,
+          y: py,
+          width: pw,
+          height: ph,
+          color: rgb(0, 0, 0),
+          opacity: 1,
+        });
+      } else if (item.kind === 'ocr-layer' && item.text) {
+        // Invisible searchable OCR text layer
+        const safeText = toWinAnsiSafe(item.text);
+        const lines = safeText.split('\n');
+        let lineY = py + ph - 10;
+        for (const l of lines) {
+          if (l.trim()) {
+            page.drawText(l, {
+              x: px + 2,
+              y: Math.max(10, lineY),
+              size: 9,
+              font: helvetica,
+              color: rgb(0, 0, 0),
+              opacity: 0,
+              maxWidth: Math.max(40, pw - 4),
+              ...rotOpt,
+            });
+          }
+          lineY -= 12;
+        }
+      } else if (item.kind === 'highlight') {
         page.drawRectangle({
           x: px,
           y: py,
@@ -671,6 +796,7 @@ export async function bakeEditsToPdf(
             font,
             color: rgb(r, g, b),
             maxWidth: Math.max(40, pw - 4),
+            ...rotOpt,
           });
           lineY -= size * 1.3;
         }
@@ -693,6 +819,7 @@ export async function bakeEditsToPdf(
           font: helvetica,
           color: rgb(0.2, 0.16, 0.04),
           maxWidth: noteW - 12,
+          ...rotOpt,
         });
       } else if (item.kind === 'stamp') {
         const label = toWinAnsiSafe(item.stampLabel || item.text || 'APPROUVÉ');
@@ -712,6 +839,7 @@ export async function bakeEditsToPdf(
           size: Math.max(11, Math.min(20, ph * 0.45)),
           font: helveticaBold,
           color: rgb(r, g, b),
+          ...rotOpt,
         });
       } else if (
         (item.kind === 'image' || item.kind === 'signature') &&
@@ -723,46 +851,36 @@ export async function bakeEditsToPdf(
             decoded.format === 'png'
               ? await pdfDoc.embedPng(decoded.bytes)
               : await pdfDoc.embedJpg(decoded.bytes);
-          page.drawImage(img, { x: px, y: py, width: pw, height: ph });
+          page.drawImage(img, { x: px, y: py, width: pw, height: ph, ...rotOpt });
         }
       } else if (item.kind === 'form-text') {
-        page.drawRectangle({
+        // Native interactive AcroForm text field!
+        fieldCounter += 1;
+        const tf = form.createTextField(`f_text_${pageIndex + 1}_${fieldCounter}`);
+        if (item.text) tf.setText(toWinAnsiSafe(item.text));
+        tf.addToPage(page, {
           x: px,
           y: py,
-          width: pw,
-          height: ph,
-          color: rgb(0.96, 0.98, 1),
+          width: Math.max(30, pw),
+          height: Math.max(16, ph),
           borderColor: rgb(0.2, 0.45, 0.8),
+          backgroundColor: rgb(0.96, 0.98, 1),
           borderWidth: 1,
         });
-        if (item.text) {
-          page.drawText(toWinAnsiSafe(item.text), {
-            x: px + 6,
-            y: py + ph * 0.32,
-            size: item.fontSize ?? 11,
-            font: helvetica,
-            color: rgb(0.1, 0.12, 0.16),
-          });
-        }
       } else if (item.kind === 'form-checkbox') {
-        page.drawRectangle({
+        // Native interactive AcroForm checkbox!
+        fieldCounter += 1;
+        const cb = form.createCheckBox(`f_check_${pageIndex + 1}_${fieldCounter}`);
+        cb.addToPage(page, {
           x: px,
           y: py,
-          width: pw,
-          height: ph,
-          color: rgb(1, 1, 1),
+          width: Math.max(12, pw),
+          height: Math.max(12, ph),
           borderColor: rgb(0.25, 0.32, 0.42),
+          backgroundColor: rgb(1, 1, 1),
           borderWidth: 1.2,
         });
-        if (item.checked) {
-          page.drawText('X', {
-            x: px + pw * 0.25,
-            y: py + ph * 0.2,
-            size: Math.max(10, ph * 0.72),
-            font: helveticaBold,
-            color: rgb(0.76, 0.25, 0.05),
-          });
-        }
+        if (item.checked) cb.check();
       }
     }
   }

@@ -17,8 +17,10 @@ export type ActiveTool =
   | 'note'
   | 'stamp'
   | 'text'
+  | 'redact'
   | 'image'
   | 'signature'
+  | 'yousign-zone'
   | 'form-text'
   | 'form-checkbox';
 
@@ -33,10 +35,12 @@ export const TOOL_LABELS_FR: Record<ActiveTool, string> = {
   note: 'Note adhésive',
   stamp: 'Tampon',
   text: 'Bloc de texte',
+  redact: 'Caviardage',
   image: 'Insertion image',
-  signature: 'Signature',
-  'form-text': 'Champ texte',
-  'form-checkbox': 'Case à cocher',
+  signature: 'Signature locale',
+  'yousign-zone': 'Zone Yousign',
+  'form-text': 'Champ texte AcroForm',
+  'form-checkbox': 'Case AcroForm',
 };
 
 export type SidebarPanel = 'thumbnails' | 'outline' | 'comments' | 'search';
@@ -66,8 +70,11 @@ export interface OverlayItem {
     | 'note'
     | 'stamp'
     | 'text'
+    | 'redact'
     | 'image'
     | 'signature'
+    | 'yousign-zone'
+    | 'ocr-layer'
     | 'form-text'
     | 'form-checkbox';
   x: number; // normalized 0..1
@@ -124,6 +131,7 @@ export interface PdfTabDocument {
   currentPage: number; // 1-based
   zoom: number;
   dirty: boolean;
+  purgeMetadata: boolean;
   overlays: OverlayItem[];
   undoStack: OverlayItem[][];
   redoStack: OverlayItem[][];
@@ -138,6 +146,14 @@ export interface SavedSignature {
   dataUrl: string;
 }
 
+export interface YousignPlacedZone {
+  page: number; // 1-based
+  x: number; // 72-DPI top-left px
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface FDesktopBridge {
   isElectron: boolean;
   platform: string;
@@ -147,13 +163,24 @@ export interface FDesktopBridge {
     bytes: Uint8Array
   ) => Promise<{ saved: boolean; filePath?: string }>;
   openExternal: (url: string) => Promise<boolean>;
+  onFileOpened?: (
+    cb: (payload: { name: string; bytes: Uint8Array }) => void
+  ) => () => void;
   yousign: {
-    getConfig: () => Promise<{ env: 'demo' | 'sandbox' | 'production'; hasApiKey: boolean }>;
+    getConfig: () => Promise<{
+      env: 'demo' | 'sandbox' | 'production';
+      hasApiKey: boolean;
+      ephemeral?: boolean;
+    }>;
     saveConfig: (cfg: {
       env: 'demo' | 'sandbox' | 'production';
       apiKey?: string;
       clearKey?: boolean;
-    }) => Promise<{ env: 'demo' | 'sandbox' | 'production'; hasApiKey: boolean }>;
+    }) => Promise<{
+      env: 'demo' | 'sandbox' | 'production';
+      hasApiKey: boolean;
+      ephemeral?: boolean;
+    }>;
     send: (req: unknown) => Promise<unknown>;
     status: (record: unknown) => Promise<unknown>;
     download: (record: unknown) => Promise<Uint8Array>;

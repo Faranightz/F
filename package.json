@@ -23,7 +23,16 @@
       "dist/**/*",
       "electron/**/*"
     ],
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "Document PDF",
+        "description": "Ouvrir avec F",
+        "role": "Editor"
+      }
+    ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         { "target": "nsis", "arch": ["x64"] },
         { "target": "portable", "arch": ["x64"] }

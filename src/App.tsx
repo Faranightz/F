@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type * as pdfjsLib from 'pdfjs-dist';
-import { createWorker } from 'tesseract.js';
+import { createWorker, type Worker as TesseractWorker } from 'tesseract.js';
 import {
   ArrowRight,
   Bold,
@@ -9,7 +9,10 @@ import {
   ChevronRight,
   Circle,
   Copy,
+  Crosshair,
   Download,
+  Eraser,
+  EyeOff,
   FileImage,
   FilePlus2,
   FileText,
@@ -55,6 +58,7 @@ import {
   type SearchMatch,
   type SidebarPanel,
   type StampPreset,
+  type YousignPlacedZone,
 } from './types/pdf';
 import {
   bakeEditsToPdf,
@@ -68,8 +72,10 @@ import {
   insertBlankPdfPage,
   loadPdfWithTask,
   mergePdfDocuments,
+  normalizeImageFileToDataUrl,
   renderBakedPageToBlob,
   reorderPdfPages,
+  rotateOverlaysForPage,
   rotatePdfPage,
   searchPdfText,
   triggerDownload,
@@ -116,6 +122,7 @@ const COLOR_PALETTE = [
 ];
 
 const SAVED_SIG_STORAGE = 'f_saved_signatures_v1';
+const RECENT_FILES_STORAGE = 'f_recent_files_v1';
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
@@ -124,6 +131,7 @@ export default function App() {
   const [tabs, setTabs] = useState<PdfTabDocument[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>('');
   const [pdfProxy, setPdfProxy] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
+  const [dragOverFile, setDragOverFile] = useState(false);
 
   const [ribbonTab, setRibbonTab] = useState<RibbonTab>('home');
   const [activeTool, setActiveTool] = useState<ActiveTool>('select');
@@ -147,9 +155,19 @@ export default function App() {
       return [];
     }
   });
+  const [recentFiles, setRecentFiles] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(RECENT_FILES_STORAGE);
+      return raw ? (JSON.parse(raw) as string[]) : [];
+    } catch {
+      return [];
+    }
+  });
 
   const [sigModalOpen, setSigModalOpen] = useState(false);
   const [yousignModalOpen, setYousignModalOpen] = useState(false);
+  const [yousignModalKey, setYousignModalKey] = useState(0);
+  const [placedYousignZone, setPlacedYousignZone] = useState<YousignPlacedZone | null>(null);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchMatch[]>([]);
@@ -160,6 +178,7 @@ export default function App() {
   const [ocrRunning, setOcrRunning] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
   const [ocrText, setOcrText] = useState('');
+  const ocrWorkerRef = useRef<TesseractWorker | null>(null);
 
   const [toast, setToast] = useState<string | null>(null);
   const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -185,6 +204,7 @@ export default function App() {
   }, []);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) || null;
+  const activeTabBytes = activeTab?.bytes ?? null;
   const hasDoc = Boolean(activeTab);
 
   const updateActiveTab = useCallback(
@@ -193,6 +213,18 @@ export default function App() {
     },
     [activeTabId]
   );
+
+  const recordRecentFile = useCallback((name: string) => {
+    setRecentFiles((prev) => {
+      const next = [name, ...prev.filter((n) => n !== name)].slice(0, 6);
+      try {
+        localStorage.setItem(RECENT_FILES_STORAGE, JSON.stringify(next));
+      } catch {
+        // ignore quota
+      }
+      return next;
+    });
+  }, []);
 
   // Open a new tab from PDF bytes with full error handling
   const openBytesInTab = useCallback(
@@ -211,6 +243,7 @@ export default function App() {
           currentPage: 1,
           zoom: 1.15,
           dirty: false,
+          purgeMetadata: false,
           overlays: [],
           undoStack: [],
           redoStack: [],
@@ -222,13 +255,14 @@ export default function App() {
         setActiveTabId(id);
         setSelectedOverlayId(null);
         setOrganizeMode(false);
+        recordRecentFile(name);
       } catch {
         showToast(
           `Impossible d’ouvrir « ${name} » (fichier corrompu ou protégé par mot de passe).`
         );
       }
     },
-    [showToast]
+    [showToast, recordRecentFile]
   );
 
   // Load initial demo PDF on mount
@@ -245,17 +279,26 @@ export default function App() {
     };
   }, [openBytesInTab]);
 
-  // Reload PDF.js proxy when active tab or its underlying bytes change, properly destroying previous task
+  // Listen for Windows .pdf file association opens from Electron main process
+  useEffect(() => {
+    if (!window.fDesktop?.onFileOpened) return;
+    return window.fDesktop.onFileOpened(({ name, bytes }) => {
+      openBytesInTab(name, new Uint8Array(bytes));
+    });
+  }, [openBytesInTab]);
+
+  // Reload PDF.js proxy when active tab or its underlying bytes change
   useEffect(() => {
     let cancelled = false;
     let activeTask: pdfjsLib.PDFDocumentLoadingTask | null = null;
-    if (!activeTab) {
-      setPdfProxy(null);
-      return;
+    if (!activeTabBytes) {
+      return () => {
+        setPdfProxy(null);
+      };
     }
     (async () => {
       try {
-        const { task, doc } = await loadPdfWithTask(activeTab.bytes);
+        const { task, doc } = await loadPdfWithTask(activeTabBytes);
         activeTask = task;
         if (!cancelled) {
           setPdfProxy(doc);
@@ -270,7 +313,7 @@ export default function App() {
       cancelled = true;
       activeTask?.destroy();
     };
-  }, [activeTab?.id, activeTab?.bytes]);
+  }, [activeTabId, activeTabBytes]);
 
   // Overlay Undo/Redo mutations
   const pushUndoSnapshot = useCallback(() => {
@@ -291,9 +334,16 @@ export default function App() {
         overlays: [...t.overlays, item],
       }));
       if (
-        ['text', 'note', 'stamp', 'image', 'signature', 'form-text', 'form-checkbox'].includes(
-          item.kind
-        )
+        [
+          'text',
+          'note',
+          'stamp',
+          'image',
+          'signature',
+          'yousign-zone',
+          'form-text',
+          'form-checkbox',
+        ].includes(item.kind)
       ) {
         setActiveTool('select');
       }
@@ -360,7 +410,8 @@ export default function App() {
       activeTab.bytes,
       activeTab.overlays,
       activeTab.watermark,
-      activeTab.headerFooter
+      activeTab.headerFooter,
+      activeTab.purgeMetadata
     );
   }, [activeTab]);
 
@@ -385,7 +436,6 @@ export default function App() {
     }
   }, [activeTab, getBakedPdfBytes, showToast, updateActiveTab]);
 
-  // Clean PDF Print (prints actual baked PDF document via hidden iframe, never app chrome)
   const handlePrint = useCallback(async () => {
     if (!activeTab) return;
     try {
@@ -420,7 +470,7 @@ export default function App() {
     }
   }, [activeTab, getBakedPdfBytes, showToast]);
 
-  // Keyboard shortcuts with proper dependencies
+  // Keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
@@ -461,7 +511,7 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [selectedOverlayId, handleDeleteOverlay, handleUndo, handleRedo, handleSavePdf, handlePrint]);
 
-  // File operations
+  // File operations + Drag & Drop PDF
   const handleOpenFile = async () => {
     try {
       if (window.fDesktop?.isElectron) {
@@ -477,16 +527,24 @@ export default function App() {
     }
   };
 
-  const handleBrowserFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files) return;
-    for (const file of Array.from(files)) {
+  const openDroppedFiles = async (fileList: FileList) => {
+    for (const file of Array.from(fileList)) {
+      if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
+        showToast(`Fichier ignoré (non PDF) : ${file.name}`);
+        continue;
+      }
       if (file.size > MAX_UPLOAD_BYTES) {
         showToast(`${file.name} dépasse la limite de 100 Mo.`);
         continue;
       }
       const buf = await file.arrayBuffer();
       await openBytesInTab(file.name, new Uint8Array(buf));
+    }
+  };
+
+  const handleBrowserFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      await openDroppedFiles(e.target.files);
     }
     e.target.value = '';
   };
@@ -511,12 +569,13 @@ export default function App() {
       const next = prev.filter((t) => t.id !== id);
       if (activeTabId === id) {
         setActiveTabId(next[next.length - 1]?.id || '');
+        if (next.length === 0) setPdfProxy(null);
       }
       return next;
     });
   };
 
-  // Page organization with full overlay remapping
+  // Page organization with full overlay remapping & rotation
   const applyPageMutation = async (
     newBytes: Uint8Array,
     toastMsg: string,
@@ -551,7 +610,7 @@ export default function App() {
     await applyPageMutation(
       out,
       `Page ${pageIndex + 1} pivotée (${deg > 0 ? '+90°' : '-90°'}).`,
-      (o) => o
+      (overlays) => rotateOverlaysForPage(overlays, pageIndex, deg)
     );
   };
 
@@ -665,7 +724,7 @@ export default function App() {
     }
   };
 
-  // Export PNG / JPEG (with all edits baked in!) & TXT
+  // Export PNG / JPEG (with all edits baked in) & TXT
   const handleExportImage = async (format: 'png' | 'jpeg') => {
     if (!activeTab) return;
     try {
@@ -689,7 +748,7 @@ export default function App() {
     showToast('Texte du document exporté (.txt).');
   };
 
-  // OCR on current rendered page
+  // Local CSP-compliant OCR via bundled worker & WASM core
   const handleRunOcr = async () => {
     const canvas = activeCanvasRef.current;
     if (!canvas) {
@@ -700,25 +759,46 @@ export default function App() {
     setOcrProgress(5);
     setOcrText('');
     try {
+      const workerUrl = new URL('./tesseract/worker.min.js', window.location.href).href;
+      const coreUrl = new URL('./tesseract/tesseract-core-lstm.wasm.js', window.location.href).href;
       const worker = await createWorker(ocrLang, 1, {
+        workerPath: workerUrl,
+        corePath: coreUrl,
+        workerBlobURL: false,
         logger: (m) => {
           if (m.status === 'recognizing text' && typeof m.progress === 'number') {
             setOcrProgress(Math.round(m.progress * 100));
           }
         },
       });
+      ocrWorkerRef.current = worker;
       const { data } = await worker.recognize(canvas);
       await worker.terminate();
+      ocrWorkerRef.current = null;
       setOcrText(data.text.trim() || '(Aucun texte détecté sur cette page)');
       setOcrProgress(100);
       showToast('Reconnaissance OCR terminée.');
     } catch (err) {
+      ocrWorkerRef.current = null;
       setOcrText(
-        `Erreur OCR : ${err instanceof Error ? err.message : 'vérifiez l’accès aux modèles Tesseract.'}`
+        `Erreur OCR : ${err instanceof Error ? err.message : 'vérifiez l’accès aux modèles de langue Tesseract.'}`
       );
     } finally {
       setOcrRunning(false);
     }
+  };
+
+  const handleCloseOcrDrawer = async () => {
+    if (ocrWorkerRef.current) {
+      try {
+        await ocrWorkerRef.current.terminate();
+      } catch {
+        // ignore
+      }
+      ocrWorkerRef.current = null;
+    }
+    setOcrRunning(false);
+    setOcrText('');
   };
 
   // Signature & Image pickers
@@ -750,7 +830,7 @@ export default function App() {
     });
   };
 
-  const handlePickImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePickImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.size > MAX_IMAGE_BYTES) {
@@ -758,16 +838,28 @@ export default function App() {
       e.target.value = '';
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        setPendingImageDataUrl(reader.result);
-        setActiveTool('image');
-        showToast('Cliquez sur la page pour insérer l’image.');
-      }
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
+    try {
+      const safeDataUrl = await normalizeImageFileToDataUrl(file);
+      setPendingImageDataUrl(safeDataUrl);
+      setActiveTool('image');
+      showToast('Cliquez sur la page pour insérer l’image.');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Format image non supporté.');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleOpenYousignModal = () => {
+    setYousignModalKey((k) => k + 1);
+    setYousignModalOpen(true);
+  };
+
+  const handleYousignZonePlaced = (zone: YousignPlacedZone) => {
+    setPlacedYousignZone(zone);
+    setYousignModalKey((k) => k + 1);
+    setYousignModalOpen(true);
+    showToast(`Zone Yousign positionnée (p.${zone.page}, X:${zone.x}, Y:${zone.y}).`);
   };
 
   const handleApplyDemoYousignStamp = (signerName: string, email: string) => {
@@ -787,7 +879,7 @@ export default function App() {
     showToast('Demande Yousign créée et cachet de suivi apposé.');
   };
 
-  // Hand tool pan handlers on scroller
+  // Hand tool pan + Ctrl+Wheel zoom
   const onScrollerPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (activeTool !== 'hand' || !scrollerRef.current) return;
     panStateRef.current = {
@@ -811,11 +903,39 @@ export default function App() {
     panStateRef.current = null;
   };
 
+  const onScrollerWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (!e.ctrlKey || !hasDoc) return;
+    e.preventDefault();
+    const delta = e.deltaY < 0 ? 0.1 : -0.1;
+    updateActiveTab((t) => ({
+      ...t,
+      zoom: Math.max(0.5, Math.min(2.6, +(t.zoom + delta).toFixed(2))),
+    }));
+  };
+
   const selectedOverlay =
     activeTab?.overlays.find((o) => o.id === selectedOverlayId) || null;
 
   return (
-    <div className={`app-shell ${darkMode ? 'theme-dark' : 'theme-light'}`}>
+    <div
+      className={`app-shell ${darkMode ? 'theme-dark' : 'theme-light'} ${dragOverFile ? 'drag-over' : ''}`}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes('Files')) {
+          e.preventDefault();
+          setDragOverFile(true);
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragOverFile(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOverFile(false);
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          openDroppedFiles(e.dataTransfer.files);
+        }
+      }}
+    >
       <input
         ref={fileInputRef}
         type="file"
@@ -827,7 +947,7 @@ export default function App() {
       <input
         ref={imageInputRef}
         type="file"
-        accept="image/png,image/jpeg"
+        accept="image/*"
         hidden
         onChange={handlePickImage}
       />
@@ -842,7 +962,12 @@ export default function App() {
         </div>
 
         <div className="quick-access">
-          <button className="qa-btn" onClick={handleOpenFile} title="Ouvrir un PDF" aria-label="Ouvrir un PDF">
+          <button
+            className="qa-btn"
+            onClick={handleOpenFile}
+            title="Ouvrir un PDF"
+            aria-label="Ouvrir un PDF"
+          >
             <FolderOpen size={15} />
           </button>
           <button
@@ -925,7 +1050,7 @@ export default function App() {
         <div className="titlebar-right">
           <button
             className="yousign-top-pill"
-            onClick={() => setYousignModalOpen(true)}
+            onClick={handleOpenYousignModal}
             disabled={!hasDoc}
             title="Envoyer pour signature électronique Yousign eIDAS"
           >
@@ -1208,6 +1333,15 @@ export default function App() {
                   <ImagePlus size={18} />
                   <span>Insérer image</span>
                 </button>
+                <button
+                  className={`tool-btn ${activeTool === 'redact' ? 'active' : ''}`}
+                  disabled={!hasDoc}
+                  onClick={() => setActiveTool('redact')}
+                  title="Caviarder définitivement une zone sensible en noir opaque"
+                >
+                  <EyeOff size={18} />
+                  <span>Caviarder</span>
+                </button>
                 <label className="ribbon-inline-field">
                   <span>Taille</span>
                   <input
@@ -1281,21 +1415,23 @@ export default function App() {
                     />
                     <span>En-tête / Pied</span>
                   </label>
-                  {activeTab.headerFooter.enabled && (
+                  <label
+                    className="ribbon-toggle"
+                    title="Supprime Auteur, Titre et Logiciel lors de l’export PDF"
+                  >
                     <input
-                      className="ribbon-input"
-                      aria-label="Texte en-tête gauche"
-                      value={activeTab.headerFooter.headerLeft}
+                      type="checkbox"
+                      checked={activeTab.purgeMetadata}
                       onChange={(e) =>
                         updateActiveTab((t) => ({
                           ...t,
                           dirty: true,
-                          headerFooter: { ...t.headerFooter, headerLeft: e.target.value },
+                          purgeMetadata: e.target.checked,
                         }))
                       }
-                      placeholder="En-tête"
                     />
-                  )}
+                    <span>Purger métadonnées</span>
+                  </label>
                 </div>
               )}
             </>
@@ -1391,17 +1527,19 @@ export default function App() {
                   className={`tool-btn ${activeTool === 'form-text' ? 'active' : ''}`}
                   disabled={!hasDoc}
                   onClick={() => setActiveTool('form-text')}
+                  title="Champ texte AcroForm natif remplissable"
                 >
                   <TextCursorInput size={18} />
-                  <span>Champ texte</span>
+                  <span>Champ AcroForm</span>
                 </button>
                 <button
                   className={`tool-btn ${activeTool === 'form-checkbox' ? 'active' : ''}`}
                   disabled={!hasDoc}
                   onClick={() => setActiveTool('form-checkbox')}
+                  title="Case à cocher AcroForm native"
                 >
                   <CheckSquare size={18} />
-                  <span>Case à cocher</span>
+                  <span>Case AcroForm</span>
                 </button>
                 <button
                   className={`tool-btn ${activeTool === 'signature' ? 'active' : ''}`}
@@ -1415,9 +1553,20 @@ export default function App() {
               <div className="ribbon-sep" />
               <div className="ribbon-group">
                 <button
+                  className={`tool-btn ${activeTool === 'yousign-zone' ? 'active' : ''}`}
+                  disabled={!hasDoc}
+                  onClick={() => {
+                    setActiveTool('yousign-zone');
+                    showToast('Cliquez sur la page pour placer visuellement la zone Yousign.');
+                  }}
+                >
+                  <Crosshair size={18} />
+                  <span>Zone Yousign</span>
+                </button>
+                <button
                   className="tool-btn yousign-ribbon-btn"
                   disabled={!hasDoc}
-                  onClick={() => setYousignModalOpen(true)}
+                  onClick={handleOpenYousignModal}
                 >
                   <ShieldCheck size={18} />
                   <span>Envoyer via Yousign</span>
@@ -1530,7 +1679,10 @@ export default function App() {
             <div className="empty-workspace">
               <FileText size={48} />
               <h2>Aucun document ouvert</h2>
-              <p>Ouvrez un fichier PDF existant ou créez un nouveau document vierge dans F.</p>
+              <p>
+                Glissez-déposez un fichier PDF ici, ouvrez un fichier existant ou créez un nouveau
+                document vierge dans <strong>F</strong>.
+              </p>
               <div className="empty-actions">
                 <button className="btn-primary" onClick={handleOpenFile}>
                   <FolderOpen size={16} /> Ouvrir un PDF
@@ -1539,6 +1691,12 @@ export default function App() {
                   <FilePlus2 size={16} /> Nouveau PDF vierge
                 </button>
               </div>
+              {recentFiles.length > 0 && (
+                <div className="recent-files-box">
+                  <strong>Documents récents :</strong>
+                  <span>{recentFiles.join(' · ')}</span>
+                </div>
+              )}
             </div>
           ) : organizeMode ? (
             <OrganizeView
@@ -1563,6 +1721,7 @@ export default function App() {
               onPointerDown={onScrollerPointerDown}
               onPointerMove={onScrollerPointerMove}
               onPointerUp={onScrollerPointerUp}
+              onWheel={onScrollerWheel}
             >
               <PageCanvas
                 pdfDoc={pdfProxy}
@@ -1585,6 +1744,7 @@ export default function App() {
                 onAddOverlay={handleAddOverlay}
                 onUpdateOverlay={handleUpdateOverlay}
                 onDeleteOverlay={handleDeleteOverlay}
+                onYousignZonePlaced={handleYousignZonePlaced}
                 onCanvasReady={handleCanvasReady}
               />
             </div>
@@ -1598,8 +1758,8 @@ export default function App() {
               <strong>Résultat OCR ({ocrLang.toUpperCase()})</strong>
               <button
                 className="icon-btn"
-                onClick={() => setOcrText('')}
-                title="Fermer le panneau OCR"
+                onClick={handleCloseOcrDrawer}
+                title="Fermer / Annuler l’OCR"
                 aria-label="Fermer le panneau OCR"
               >
                 <X size={15} />
@@ -1624,11 +1784,35 @@ export default function App() {
               <button
                 className="btn-secondary btn-sm"
                 onClick={() => {
-                  navigator.clipboard.writeText(ocrText);
-                  showToast('Texte OCR copié dans le presse-papiers.');
+                  navigator.clipboard
+                    .writeText(ocrText)
+                    .then(() => showToast('Texte OCR copié dans le presse-papiers.'))
+                    .catch(() => showToast('Accès au presse-papiers refusé.'));
                 }}
               >
                 <Copy size={13} /> Copier
+              </button>
+              <button
+                className="btn-secondary btn-sm"
+                title="Injecte le texte OCR en couche invisible dans le PDF pour le rendre recherchable"
+                onClick={() => {
+                  if (!activeTab || !ocrText.trim()) return;
+                  handleAddOverlay({
+                    id: crypto.randomUUID(),
+                    pageIndex: activeTab.currentPage - 1,
+                    kind: 'ocr-layer',
+                    x: 0.04,
+                    y: 0.04,
+                    w: 0.42,
+                    h: 0.04,
+                    color: '#0f766e',
+                    text: ocrText,
+                    createdAt: new Date().toISOString(),
+                  });
+                  showToast('Couche OCR invisible ajoutée (PDF recherchable à l’export).');
+                }}
+              >
+                <Eraser size={13} /> Couche invisible
               </button>
               <button
                 className="btn-primary btn-sm"
@@ -1650,7 +1834,7 @@ export default function App() {
                   showToast('Texte OCR inséré sur la page.');
                 }}
               >
-                Insérer sur la page
+                Insérer texte
               </button>
             </div>
           </aside>
@@ -1727,7 +1911,7 @@ export default function App() {
               type="range"
               aria-label="Niveau de zoom"
               min={0.5}
-              max={2.4}
+              max={2.6}
               step={0.05}
               value={activeTab.zoom}
               onChange={(e) =>
@@ -1749,11 +1933,18 @@ export default function App() {
 
       {activeTab && (
         <YousignModal
+          key={`${activeTab.id}-${yousignModalKey}`}
           isOpen={yousignModalOpen}
           onClose={() => setYousignModalOpen(false)}
           documentName={activeTab.name}
           numPages={activeTab.numPages}
           currentPage={activeTab.currentPage}
+          placedZone={placedYousignZone}
+          onRequestVisualPlacement={() => {
+            setYousignModalOpen(false);
+            setActiveTool('yousign-zone');
+            showToast('Cliquez sur la page pour placer la zone de signature Yousign.');
+          }}
           getBakedPdfBytes={getBakedPdfBytes}
           onOpenSignedPdf={(name, bytes) => {
             openBytesInTab(name, bytes);
@@ -1761,6 +1952,13 @@ export default function App() {
           }}
           onApplyDemoYousignStamp={handleApplyDemoYousignStamp}
         />
+      )}
+
+      {dragOverFile && (
+        <div className="drop-overlay">
+          <FolderOpen size={44} />
+          <strong>Déposez vos fichiers PDF pour les ouvrir dans F</strong>
+        </div>
       )}
 
       {toast && (

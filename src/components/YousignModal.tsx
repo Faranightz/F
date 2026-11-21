@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   CheckCircle2,
   Copy,
+  Crosshair,
   Download,
   ExternalLink,
   Plus,
@@ -11,6 +12,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import type { YousignPlacedZone } from '../types/pdf';
 import {
   createAndSendYousignRequest,
   downloadSignedYousignPdf,
@@ -33,6 +35,8 @@ interface YousignModalProps {
   documentName: string;
   numPages: number;
   currentPage: number;
+  placedZone: YousignPlacedZone | null;
+  onRequestVisualPlacement: () => void;
   getBakedPdfBytes: () => Promise<Uint8Array>;
   onOpenSignedPdf: (name: string, bytes: Uint8Array) => void;
   onApplyDemoYousignStamp: (signerName: string, email: string) => void;
@@ -44,6 +48,8 @@ export const YousignModal: React.FC<YousignModalProps> = ({
   documentName,
   numPages,
   currentPage,
+  placedZone,
+  onRequestVisualPlacement,
   getBakedPdfBytes,
   onOpenSignedPdf,
   onApplyDemoYousignStamp,
@@ -54,21 +60,21 @@ export const YousignModal: React.FC<YousignModalProps> = ({
   const [history, setHistory] = useState<YousignRequestRecord[]>(() => loadYousignHistory());
 
   const [requestName, setRequestName] = useState(
-    `Signature — ${documentName.replace(/\.pdf$/i, '')}`
+    () => `Signature — ${documentName.replace(/\.pdf$/i, '')}`
   );
   const [deliveryMode, setDeliveryMode] = useState<'email' | 'none'>('email');
-  const [signers, setSigners] = useState<YousignSignerInput[]>([
+  const [signers, setSigners] = useState<YousignSignerInput[]>(() => [
     {
       id: crypto.randomUUID(),
       firstName: 'Camille',
       lastName: 'Martin',
       email: 'camille.martin@exemple.fr',
       phoneNumber: '',
-      page: currentPage,
-      x: 75,
-      y: 620,
-      width: 200,
-      height: 60,
+      page: placedZone?.page ?? currentPage,
+      x: placedZone?.x ?? 75,
+      y: placedZone?.y ?? 620,
+      width: placedZone?.width ?? 200,
+      height: placedZone?.height ?? 60,
       signatureLevel: 'electronic_signature',
     },
   ]);
@@ -78,20 +84,19 @@ export const YousignModal: React.FC<YousignModalProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Sync document name, page, and persisted Electron DPAPI config whenever modal opens
   useEffect(() => {
     if (!isOpen) return;
-    setRequestName(`Signature — ${documentName.replace(/\.pdf$/i, '')}`);
-    setSigners((prev) =>
-      prev.map((s, idx) =>
-        idx === 0 ? { ...s, page: Math.max(1, Math.min(numPages, currentPage)) } : s
-      )
-    );
-    setError(null);
-    loadYousignConfigState().then(setConfig).catch(() => {});
-  }, [isOpen, documentName, currentPage, numPages]);
+    let cancelled = false;
+    loadYousignConfigState()
+      .then((cfg) => {
+        if (!cancelled) setConfig(cfg);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen]);
 
-  // Close on Escape
   useEffect(() => {
     if (!isOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -230,9 +235,15 @@ export const YousignModal: React.FC<YousignModalProps> = ({
   };
 
   const copyLink = (link: string, key: string) => {
-    navigator.clipboard.writeText(link);
-    setCopiedId(key);
-    setTimeout(() => setCopiedId(null), 1800);
+    navigator.clipboard
+      .writeText(link)
+      .then(() => {
+        setCopiedId(key);
+        setTimeout(() => setCopiedId(null), 1800);
+      })
+      .catch(() => {
+        setError('Accès au presse-papiers refusé.');
+      });
   };
 
   return (
@@ -332,10 +343,27 @@ export const YousignModal: React.FC<YousignModalProps> = ({
 
               <div className="section-header-row">
                 <h3>Signataires ({signers.length})</h3>
-                <button type="button" className="btn-secondary btn-sm" onClick={addSigner}>
-                  <Plus size={14} /> Ajouter un signataire
-                </button>
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={onRequestVisualPlacement}
+                    title="Cliquer/glisser directement sur le PDF pour positionner la zone Yousign"
+                  >
+                    <Crosshair size={14} /> Placer visuellement sur le PDF
+                  </button>
+                  <button type="button" className="btn-secondary btn-sm" onClick={addSigner}>
+                    <Plus size={14} /> Ajouter un signataire
+                  </button>
+                </div>
               </div>
+
+              {placedZone && (
+                <div className="alert-info" role="status">
+                  Zone placée visuellement : Page {placedZone.page} — X:{placedZone.x}, Y:
+                  {placedZone.y} ({placedZone.width}×{placedZone.height} px à 72 DPI)
+                </div>
+              )}
 
               <div className="signer-list">
                 {signers.map((signer, index) => {
