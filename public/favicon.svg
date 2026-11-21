@@ -1,4 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#c2410c"/>
-  <path d="M21 15h24v8H30v8h12v8H30v12h-9V15z" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="F-pdf">
+  <rect width="64" height="64" rx="14" fill="#1746D1"/>
+  <path d="M20 14h26v8H29v7h14v8H29v13h-9z" fill="#FFFFFF"/>
+  <path d="M38 44h14l-3 8H35z" fill="#E83E8C"/>
 </svg>

@@ -21,6 +21,30 @@ function getYousignConfigPath() {
   return path.join(app.getPath('userData'), 'f-yousign-config.enc');
 }
 
+// Validates a Yousign history record coming from the renderer before any network call
+function assertYousignRecord(record) {
+  if (
+    !record ||
+    (record.env !== 'sandbox' && record.env !== 'production') ||
+    typeof record.id !== 'string' ||
+    !/^[A-Za-z0-9-]{1,80}$/.test(record.id) ||
+    (record.documentId !== undefined && !/^[A-Za-z0-9-]{1,80}$/.test(String(record.documentId)))
+  ) {
+    throw new Error('Demande Yousign invalide.');
+  }
+}
+
+// Reads Yousign's error detail (never contains our API key) to give a useful message
+async function yousignErrorDetail(res) {
+  try {
+    const data = await res.json();
+    const detail = data?.detail || data?.message || data?.title;
+    return detail ? ` — ${String(detail).slice(0, 200)}` : '';
+  } catch {
+    return '';
+  }
+}
+
 function getYousignBaseUrl(env) {
   return env === 'production'
     ? 'https://api.yousign.app/v3'
@@ -96,9 +120,9 @@ function createWindow() {
     height: 920,
     minWidth: 1024,
     minHeight: 680,
-    title: 'F',
-    icon: path.join(__dirname, '../build/icon.ico'),
-    backgroundColor: '#f1f3f6',
+    title: 'F-pdf',
+    icon: path.join(__dirname, '../dist/icon.png'),
+    backgroundColor: '#f5f7fc',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -123,6 +147,20 @@ function createWindow() {
         shell.openExternal(targetUrl);
       }
     }
+  });
+
+  // The renderer blocks unload when a document is unsaved: ask the user what to do
+  mainWindow.webContents.on('will-prevent-unload', (event) => {
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      buttons: ['Quitter sans enregistrer', 'Annuler'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'Modifications non enregistrées — F-pdf',
+      message: 'Un ou plusieurs documents contiennent des modifications non enregistrées.',
+      detail: 'Si vous quittez maintenant, ces modifications seront perdues.',
+    });
+    if (choice === 0) event.preventDefault(); // preventDefault here = allow closing
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -169,7 +207,7 @@ if (!gotLock) {
 ipcMain.handle('dialog:openPdf', async (event) => {
   assertMainSender(event);
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: 'Ouvrir un document PDF — F',
+    title: 'Ouvrir un document PDF — F-pdf',
     filters: [{ name: 'Documents PDF', extensions: ['pdf'] }],
     properties: ['openFile', 'multiSelections'],
   });
@@ -205,7 +243,7 @@ ipcMain.handle('dialog:savePdf', async (event, payload) => {
   const defaultPath = safeBase.toLowerCase().endsWith('.pdf') ? safeBase : `${safeBase}.pdf`;
 
   const result = await dialog.showSaveDialog(mainWindow, {
-    title: 'Enregistrer le document PDF — F',
+    title: 'Enregistrer le document PDF — F-pdf',
     defaultPath,
     filters: [{ name: 'Document PDF', extensions: ['pdf'] }],
   });
@@ -283,13 +321,13 @@ ipcMain.handle('yousign:send', async (event, req) => {
     headers: { ...authHeaders, 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     body: JSON.stringify({
-      name: String(req.requestName || 'Document F'),
+      name: String(req.requestName || 'Document F-pdf'),
       delivery_mode: req.deliveryMode === 'none' ? 'none' : 'email',
       timezone: 'Europe/Paris',
     }),
   });
   if (!createRes.ok) {
-    throw new Error(`Yousign : échec création de demande (HTTP ${createRes.status}).`);
+    throw new Error(`Yousign : échec création de demande (HTTP ${createRes.status})${await yousignErrorDetail(createRes)}`);
   }
   const sr = await createRes.json();
 
@@ -310,7 +348,7 @@ ipcMain.handle('yousign:send', async (event, req) => {
     body: formData,
   });
   if (!docRes.ok) {
-    throw new Error(`Yousign : échec téléversement PDF (HTTP ${docRes.status}).`);
+    throw new Error(`Yousign : échec téléversement PDF (HTTP ${docRes.status})${await yousignErrorDetail(docRes)}`);
   }
   const doc = await docRes.json();
 
@@ -352,7 +390,7 @@ ipcMain.handle('yousign:send', async (event, req) => {
       body: JSON.stringify(signerPayload),
     });
     if (!sRes.ok) {
-      throw new Error(`Yousign : échec ajout signataire ${signer.email} (HTTP ${sRes.status}).`);
+      throw new Error(`Yousign : échec ajout signataire ${signer.email} (HTTP ${sRes.status})${await yousignErrorDetail(sRes)}`);
     }
   }
 
@@ -362,13 +400,13 @@ ipcMain.handle('yousign:send', async (event, req) => {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!actRes.ok) {
-    throw new Error(`Yousign : échec activation de la demande (HTTP ${actRes.status}).`);
+    throw new Error(`Yousign : échec activation de la demande (HTTP ${actRes.status})${await yousignErrorDetail(actRes)}`);
   }
   const activated = await actRes.json();
 
   return {
     id: activated.id || sr.id,
-    name: String(req.requestName || 'Document F'),
+    name: String(req.requestName || 'Document F-pdf'),
     env: cfg.env,
     status: activated.status || 'ongoing',
     createdAt: new Date().toISOString(),
@@ -384,6 +422,7 @@ ipcMain.handle('yousign:send', async (event, req) => {
 
 ipcMain.handle('yousign:status', async (event, record) => {
   assertMainSender(event);
+  assertYousignRecord(record);
   const cfg = await readYousignSecretConfig();
   if (cfg.env !== record.env) {
     throw new Error(`Environnement différent : la demande appartient à ${record.env.toUpperCase()}.`);
@@ -400,7 +439,7 @@ ipcMain.handle('yousign:status', async (event, record) => {
     }
   );
   if (!res.ok) {
-    throw new Error(`Impossible de rafraîchir le statut (HTTP ${res.status}).`);
+    throw new Error(`Impossible de rafraîchir le statut (HTTP ${res.status})${await yousignErrorDetail(res)}`);
   }
   const data = await res.json();
   return {
@@ -416,6 +455,7 @@ ipcMain.handle('yousign:status', async (event, record) => {
 
 ipcMain.handle('yousign:download', async (event, record) => {
   assertMainSender(event);
+  assertYousignRecord(record);
   const cfg = await readYousignSecretConfig();
   if (cfg.env !== record.env) {
     throw new Error(`Environnement différent : la demande appartient à ${record.env.toUpperCase()}.`);
@@ -432,7 +472,7 @@ ipcMain.handle('yousign:download', async (event, record) => {
     }
   );
   if (!res.ok) {
-    throw new Error(`Téléchargement PDF signé impossible (HTTP ${res.status}).`);
+    throw new Error(`Téléchargement PDF signé impossible (HTTP ${res.status})${await yousignErrorDetail(res)}`);
   }
   const buf = await res.arrayBuffer();
   return new Uint8Array(buf);
@@ -442,7 +482,7 @@ app.whenReady().then(() => {
   if (!isDev) {
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
       const csp =
-        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' blob: data: https://tessdata.projectnaptha.com https://cdn.jsdelivr.net; frame-src 'self' blob:; object-src 'none'; base-uri 'self';";
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' blob: data:; frame-src 'self' blob:; object-src 'none'; base-uri 'self';";
       callback({
         responseHeaders: {
           ...details.responseHeaders,
@@ -451,6 +491,12 @@ app.whenReady().then(() => {
       });
     });
   }
+
+  // Deny every browser permission except copying text (camera, micro, geolocation, notifications...)
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) =>
+    callback(permission === 'clipboard-sanitized-write')
+  );
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'clipboard-sanitized-write');
 
   createWindow();
 

@@ -1,6 +1,6 @@
-# F — Éditeur PDF Windows
+# F-pdf — Éditeur PDF Windows
 
-**F** est un éditeur PDF desktop pour Windows (Electron + React + TypeScript + PDF.js + pdf-lib + Tesseract.js) avec interface Ruban multi-onglets, annotations, organisation de pages, OCR et intégration **Yousign eIDAS (API v3)**.
+**F-pdf** est un éditeur PDF desktop pour Windows (Electron + React + TypeScript + PDF.js + pdf-lib + Tesseract.js) avec interface Ruban multi-onglets, annotations, organisation de pages, OCR et intégration **Yousign eIDAS (API v3)**.
 
 ## Fonctionnalités
 - **Interface Ruban multi-onglets** (*Accueil*, *Commentaire*, *Éditer*, *Organiser*, *Formulaire & Signer*, *Convertir & OCR*) + mode clair / sombre conforme WCAG AA.
@@ -22,7 +22,7 @@ npm run build:win
 
 Les exécutables Windows (installateur NSIS `x64` + version portable `x64`) sont générés dans `release/`.
 
-Pour lancer **F** en développement desktop :
+Pour lancer **F-pdf** en développement desktop :
 
 ```bash
 npm run electron:dev

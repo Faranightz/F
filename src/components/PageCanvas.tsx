@@ -248,7 +248,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
         y: pt.y,
         w: 0.03,
         h: 0.022,
-        color: '#c2410c',
+        color: '#1746d1',
         checked: true,
         createdAt: now,
       };
@@ -306,7 +306,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
         y,
         w,
         h,
-        color: '#0f766e',
+        color: '#10213a',
         text: 'Zone Signature Yousign',
         createdAt: now,
       };
@@ -609,7 +609,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                 width={nw}
                 height={nh}
                 fill="#000000"
-                stroke={isSelected ? '#c2410c' : 'none'}
+                stroke={isSelected ? '#1746d1' : 'none'}
                 strokeWidth={isSelected ? 2 : 0}
                 style={{
                   pointerEvents: activeTool === 'select' ? 'all' : 'none',
@@ -630,7 +630,7 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                 height={nh}
                 fill={item.color}
                 fillOpacity={item.opacity ?? 0.36}
-                stroke={isSelected ? '#c2410c' : 'none'}
+                stroke={isSelected ? '#1746d1' : 'none'}
                 strokeWidth={isSelected ? 1.5 : 0}
                 style={{
                   pointerEvents: activeTool === 'select' ? 'all' : 'none',

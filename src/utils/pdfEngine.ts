@@ -6,6 +6,8 @@ import {
   rgb,
   degrees,
   PageSizes,
+  PDFName,
+  type PDFForm,
 } from 'pdf-lib';
 import type {
   HeaderFooterConfig,
@@ -220,10 +222,10 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     y: height - 115,
     width,
     height: 115,
-    color: rgb(0.76, 0.25, 0.05),
+    color: rgb(0.09, 0.275, 0.82),
   });
 
-  p1.drawText('F — ÉDITEUR PDF WINDOWS', {
+  p1.drawText('F-pdf — ÉDITEUR PDF WINDOWS', {
     x: 48,
     y: height - 54,
     size: 24,
@@ -235,11 +237,11 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     y: height - 82,
     size: 12,
     font: helvetica,
-    color: rgb(1, 0.94, 0.88),
+    color: rgb(0.91, 0.93, 0.99),
   });
 
   let y = height - 165;
-  p1.drawText('1. Bienvenue dans F', {
+  p1.drawText('1. Bienvenue dans F-pdf', {
     x: 48,
     y,
     size: 15,
@@ -250,7 +252,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
   y -= 28;
   const lines1 = [
     'Ce document de démonstration multi-pages vous permet de tester immédiatement',
-    'toutes les fonctionnalités de F directement depuis le ruban :',
+    'toutes les fonctionnalités de F-pdf directement depuis le ruban :',
     '',
     '  • Onglet Accueil : zoom Ctrl+Molette, main (pan), rotation, recherche plein texte.',
     '  • Onglet Commentaire : surlignage, stylo, formes, notes adhésives, tampons.',
@@ -275,8 +277,8 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     y: y - 90,
     width: width - 96,
     height: 78,
-    color: rgb(0.99, 0.96, 0.92),
-    borderColor: rgb(0.76, 0.25, 0.05),
+    color: rgb(0.96, 0.97, 0.99),
+    borderColor: rgb(0.09, 0.275, 0.82),
     borderWidth: 1.2,
   });
   p1.drawText('Astuce rapide :', {
@@ -284,7 +286,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
     y: y - 34,
     size: 11,
     font: helveticaBold,
-    color: rgb(0.76, 0.25, 0.05),
+    color: rgb(0.09, 0.275, 0.82),
   });
   p1.drawText(
     'Glissez-déposez un fichier .pdf dans la fenêtre ou utilisez Ctrl+S pour enregistrer',
@@ -438,7 +440,7 @@ export async function createSamplePdf(): Promise<Uint8Array> {
       height: 28,
       color:
         idx === 0
-          ? rgb(0.15, 0.18, 0.22)
+          ? rgb(0.063, 0.13, 0.227)
           : idx % 2 === 0
             ? rgb(0.96, 0.97, 0.98)
             : rgb(1, 1, 1),
@@ -576,6 +578,8 @@ export async function bakeEditsToPdf(
   const totalPages = pages.length;
 
   if (purgeMetadata) {
+    // Remove the XMP metadata stream too (it can hold author, tool and history)
+    pdfDoc.catalog.delete(PDFName.of('Metadata'));
     pdfDoc.setTitle('');
     pdfDoc.setAuthor('');
     pdfDoc.setSubject('');
@@ -674,7 +678,7 @@ export async function bakeEditsToPdf(
       // Visual-only Yousign placement guide is not baked into the PDF document
       if (item.kind === 'yousign-zone') continue;
 
-      const [r, g, b] = hexToRgbTuple(item.color || '#c2410c');
+      const [r, g, b] = hexToRgbTuple(item.color || '#1746d1');
       const box = visualRectToPdfBox(item.x, item.y, item.w, item.h, width, height, rotDeg);
       const { x: px, y: py, w: pw, h: ph } = box;
       const rotOpt = rotDeg ? { rotate: degrees(rotDeg) } : {};
@@ -856,7 +860,7 @@ export async function bakeEditsToPdf(
       } else if (item.kind === 'form-text') {
         // Native interactive AcroForm text field!
         fieldCounter += 1;
-        const tf = form.createTextField(`f_text_${pageIndex + 1}_${fieldCounter}`);
+        const tf = form.createTextField(uniqueFieldName(form, `f_text_${pageIndex + 1}_${fieldCounter}`));
         if (item.text) tf.setText(toWinAnsiSafe(item.text));
         tf.addToPage(page, {
           x: px,
@@ -870,7 +874,7 @@ export async function bakeEditsToPdf(
       } else if (item.kind === 'form-checkbox') {
         // Native interactive AcroForm checkbox!
         fieldCounter += 1;
-        const cb = form.createCheckBox(`f_check_${pageIndex + 1}_${fieldCounter}`);
+        const cb = form.createCheckBox(uniqueFieldName(form, `f_check_${pageIndex + 1}_${fieldCounter}`));
         cb.addToPage(page, {
           x: px,
           y: py,
@@ -885,7 +889,79 @@ export async function bakeEditsToPdf(
     }
   }
 
-  return pdfDoc.save();
+  const bakedBytes = await pdfDoc.save();
+
+  // True redaction: a black box alone leaves the hidden text extractable.
+  // Pages holding a redaction are flattened to an image so nothing remains underneath.
+  const redactedPages = [
+    ...new Set(overlays.filter((o) => o.kind === 'redact').map((o) => o.pageIndex)),
+  ].filter((i) => i >= 0 && i < totalPages);
+  if (redactedPages.length === 0) return bakedBytes;
+  return flattenPagesToImages(bakedBytes, redactedPages);
+}
+
+function uniqueFieldName(form: PDFForm, base: string): string {
+  let name = base;
+  let n = 1;
+  while (form.getFieldMaybe(name)) {
+    n += 1;
+    name = `${base}_${n}`;
+  }
+  return name;
+}
+
+const REDACTION_RENDER_SCALE = 2.5; // about 180 DPI
+
+/**
+ * Replaces each listed page by a rasterized copy (same visual size).
+ * The original content streams, text, annotations and form widgets of those pages are dropped.
+ */
+export async function flattenPagesToImages(
+  pdfBytes: Uint8Array,
+  pageIndices: number[]
+): Promise<Uint8Array> {
+  const { task, doc: proxy } = await loadPdfWithTask(pdfBytes);
+  try {
+    const out = await PDFDocument.load(pdfBytes);
+    const form = out.getForm();
+    for (const pageIndex of [...pageIndices].sort((a, b) => a - b)) {
+      const page = await proxy.getPage(pageIndex + 1);
+      const viewport = page.getViewport({ scale: REDACTION_RENDER_SCALE });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Contexte canvas indisponible pour le caviardage.');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+      const blob = await new Promise<Blob>((resolve, reject) =>
+        canvas.toBlob(
+          (b) => (b ? resolve(b) : reject(new Error('Échec du caviardage.'))),
+          'image/jpeg',
+          0.9
+        )
+      );
+      const jpg = await out.embedJpg(new Uint8Array(await blob.arrayBuffer()));
+
+      // Remove form fields whose widgets live on this page (otherwise they stay orphaned)
+      const oldPage = out.getPage(pageIndex);
+      for (const field of form.getFields()) {
+        if (field.acroField.getWidgets().some((w) => w.P() === oldPage.ref)) {
+          form.removeField(field);
+        }
+      }
+
+      const w = viewport.width / REDACTION_RENDER_SCALE;
+      const h = viewport.height / REDACTION_RENDER_SCALE;
+      out.removePage(pageIndex);
+      const newPage = out.insertPage(pageIndex, [w, h]);
+      newPage.drawImage(jpg, { x: 0, y: 0, width: w, height: h });
+    }
+    return await out.save();
+  } finally {
+    await task.destroy();
+  }
 }
 
 export async function renderBakedPageToBlob(

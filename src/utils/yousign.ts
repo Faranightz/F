@@ -125,18 +125,18 @@ export async function createAndSendYousignRequest(params: {
       status: 'ongoing',
       createdAt: new Date().toISOString(),
       documentId: `doc-${fakeId}`,
-      signers: signers.map((s, idx) => ({
+      // No signature link in demo: a fake yousign.app URL would lead users to a real site
+      signers: signers.map((s) => ({
         name: `${s.firstName} ${s.lastName}`.trim(),
         email: s.email,
         status: 'notified',
-        signatureLink: `https://yousign.app/signatures/${fakeId}?signer=${idx + 1}`,
       })),
     };
   }
 
   if (!window.fDesktop?.isElectron) {
     throw new Error(
-      'Pour votre sécurité (stockage chiffré DPAPI et politique CORS de l’API Yousign v3), les envois réels Sandbox/Production s’effectuent depuis l’application Windows F. En aperçu web, utilisez le Mode Démo.'
+      'Pour votre sécurité (stockage chiffré DPAPI et politique CORS de l’API Yousign v3), les envois réels Sandbox/Production s’effectuent depuis l’application Windows F-pdf. En aperçu web, utilisez le Mode Démo.'
     );
   }
 
@@ -168,7 +168,7 @@ export async function refreshYousignStatus(
     );
   }
   if (!window.fDesktop?.isElectron) {
-    throw new Error('Le rafraîchissement réel nécessite l’application Windows F.');
+    throw new Error('Le rafraîchissement réel nécessite l’application Windows F-pdf.');
   }
   const res = await window.fDesktop.yousign.status(record);
   return res as YousignRequestRecord;
@@ -184,7 +184,7 @@ export async function downloadSignedYousignPdf(
     );
   }
   if (!window.fDesktop?.isElectron) {
-    throw new Error('Le téléchargement réel nécessite l’application Windows F.');
+    throw new Error('Le téléchargement réel nécessite l’application Windows F-pdf.');
   }
   return window.fDesktop.yousign.download(record);
 }

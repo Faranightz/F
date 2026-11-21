@@ -66,9 +66,9 @@ export const YousignModal: React.FC<YousignModalProps> = ({
   const [signers, setSigners] = useState<YousignSignerInput[]>(() => [
     {
       id: crypto.randomUUID(),
-      firstName: 'Camille',
-      lastName: 'Martin',
-      email: 'camille.martin@exemple.fr',
+      firstName: '',
+      lastName: '',
+      email: '',
       phoneNumber: '',
       page: placedZone?.page ?? currentPage,
       x: placedZone?.x ?? 75,
@@ -165,6 +165,13 @@ export const YousignModal: React.FC<YousignModalProps> = ({
         return;
       }
     }
+    if (config.env === 'production') {
+      const list = signers.map((s) => `• ${s.firstName} ${s.lastName} <${s.email}>`).join('\n');
+      const ok = window.confirm(
+        `Envoi RÉEL en production Yousign (facturé, e-mails envoyés aux signataires) :\n\n${list}\n\nConfirmer l’envoi ?`
+      );
+      if (!ok) return;
+    }
     setBusy(true);
     try {
       setStepMsg('Préparation du document PDF avec vos modifications…');
@@ -212,8 +219,9 @@ export const YousignModal: React.FC<YousignModalProps> = ({
     setError(null);
     try {
       if (rec.env === 'demo') {
+        // Demo mode never produces a signed document: name it clearly to avoid confusion
         const bytes = await getBakedPdfBytes();
-        onOpenSignedPdf(`${rec.name} (Signé Yousign).pdf`, bytes);
+        onOpenSignedPdf(`${rec.name} (DÉMO - NON SIGNÉ).pdf`, bytes);
         onClose();
         return;
       }
@@ -633,7 +641,7 @@ export const YousignModal: React.FC<YousignModalProps> = ({
                   ) : (
                     <div className="alert-info">
                       En aperçu web, aucune clé API n’est stockée dans le navigateur (sécurité &
-                      CORS). Lancez l’application Windows <strong>F</strong> pour enregistrer votre
+                      CORS). Lancez l’application Windows <strong>F-pdf</strong> pour enregistrer votre
                       clé Yousign de façon chiffrée (Windows DPAPI) et envoyer de vraies demandes.
                     </div>
                   )}

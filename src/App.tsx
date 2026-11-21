@@ -97,9 +97,9 @@ const DEFAULT_WATERMARK = {
 
 const DEFAULT_HEADER_FOOTER = {
   enabled: false,
-  headerLeft: 'F — Document PDF',
+  headerLeft: 'F-pdf — Document PDF',
   headerRight: new Date().toLocaleDateString('fr-FR'),
-  footerLeft: 'Édité avec F',
+  footerLeft: 'Édité avec F-pdf',
   footerRight: 'Page {page} / {total}',
 };
 
@@ -113,7 +113,7 @@ const STAMP_PRESETS: StampPreset[] = [
 ];
 
 const COLOR_PALETTE = [
-  '#c2410c',
+  '#1746d1',
   '#dc2626',
   '#15803d',
   '#1d4ed8',
@@ -139,7 +139,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [organizeMode, setOrganizeMode] = useState(false);
 
-  const [toolColor, setToolColor] = useState('#c2410c');
+  const [toolColor, setToolColor] = useState('#1746d1');
   const [strokeWidth, setStrokeWidth] = useState(2.5);
   const [fontSize, setFontSize] = useState(14);
   const [stampPreset, setStampPreset] = useState<StampPreset>('APPROUVÉ');
@@ -271,13 +271,25 @@ export default function App() {
     (async () => {
       const sample = await createSamplePdf();
       if (mounted) {
-        await openBytesInTab('Guide_F_Demo.pdf', sample);
+        await openBytesInTab('Guide_F-pdf_Demo.pdf', sample);
       }
     })();
     return () => {
       mounted = false;
     };
   }, [openBytesInTab]);
+
+  // Warn before closing the window while a document has unsaved changes
+  const hasUnsaved = tabs.some((t) => t.dirty);
+  useEffect(() => {
+    if (!hasUnsaved) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [hasUnsaved]);
 
   // Listen for Windows .pdf file association opens from Electron main process
   useEffect(() => {
@@ -764,6 +776,8 @@ export default function App() {
       const worker = await createWorker(ocrLang, 1, {
         workerPath: workerUrl,
         corePath: coreUrl,
+        // Language models are bundled: OCR works offline, nothing is downloaded
+        langPath: new URL('./tesseract/lang', window.location.href).href,
         workerBlobURL: false,
         logger: (m) => {
           if (m.status === 'recognizing text' && typeof m.progress === 'number') {
@@ -872,8 +886,8 @@ export default function App() {
       y: 0.72,
       w: 0.42,
       h: 0.1,
-      color: '#0f766e',
-      text: `YOUSIGN eIDAS (Démo) — Envoyé à ${signerName} (${email}) le ${new Date().toLocaleDateString('fr-FR')}`,
+      color: '#10213a',
+      text: `DÉMO YOUSIGN — NON SIGNÉ — Simulation pour ${signerName} (${email}) le ${new Date().toLocaleDateString('fr-FR')}`,
       createdAt: new Date().toISOString(),
     });
     showToast('Demande Yousign créée et cachet de suivi apposé.');
@@ -955,10 +969,8 @@ export default function App() {
       {/* Top Window Chrome & Document Tab Strip */}
       <header className="titlebar">
         <div className="brand-block">
-          <div className="brand-badge" aria-hidden="true">
-            F
-          </div>
-          <h1 className="brand-title">F</h1>
+          <img className="brand-badge" src="./favicon.svg" alt="" aria-hidden="true" />
+          <h1 className="brand-title">F-pdf</h1>
         </div>
 
         <div className="quick-access">
@@ -1337,7 +1349,7 @@ export default function App() {
                   className={`tool-btn ${activeTool === 'redact' ? 'active' : ''}`}
                   disabled={!hasDoc}
                   onClick={() => setActiveTool('redact')}
-                  title="Caviarder définitivement une zone sensible en noir opaque"
+                  title="Caviarder définitivement une zone sensible. À l’enregistrement, la page concernée devient une image : le texte caché est réellement supprimé."
                 >
                   <EyeOff size={18} />
                   <span>Caviarder</span>
@@ -1681,7 +1693,7 @@ export default function App() {
               <h2>Aucun document ouvert</h2>
               <p>
                 Glissez-déposez un fichier PDF ici, ouvrez un fichier existant ou créez un nouveau
-                document vierge dans <strong>F</strong>.
+                document vierge dans <strong>F-pdf</strong>.
               </p>
               <div className="empty-actions">
                 <button className="btn-primary" onClick={handleOpenFile}>
@@ -1805,7 +1817,7 @@ export default function App() {
                     y: 0.04,
                     w: 0.42,
                     h: 0.04,
-                    color: '#0f766e',
+                    color: '#10213a',
                     text: ocrText,
                     createdAt: new Date().toISOString(),
                   });
@@ -1850,7 +1862,7 @@ export default function App() {
           {activeTab && (
             <span className="status-meta">
               {activeTab.overlays.length} annotation(s) ·{' '}
-              {window.fDesktop?.isElectron ? 'F Desktop Windows' : 'Aperçu Web'}
+              {window.fDesktop?.isElectron ? 'F-pdf Desktop Windows' : 'Aperçu Web'}
             </span>
           )}
         </div>
@@ -1957,7 +1969,7 @@ export default function App() {
       {dragOverFile && (
         <div className="drop-overlay">
           <FolderOpen size={44} />
-          <strong>Déposez vos fichiers PDF pour les ouvrir dans F</strong>
+          <strong>Déposez vos fichiers PDF pour les ouvrir dans F-pdf</strong>
         </div>
       )}
 
