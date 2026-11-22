@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type * as pdfjsLib from 'pdfjs-dist';
-import { GripHorizontal, ShieldCheck, Trash2 } from 'lucide-react';
+import * as pdfjsLib from 'pdfjs-dist';
+import { FileBadge, GripHorizontal, ShieldCheck, Trash2 } from 'lucide-react';
 import type {
   ActiveTool,
   HeaderFooterConfig,
@@ -34,6 +34,8 @@ interface PageCanvasProps {
   onDeleteOverlay: (id: string) => void;
   onYousignZonePlaced?: (zone: YousignPlacedZone) => void;
   onCanvasReady?: (canvas: HTMLCanvasElement | null) => void;
+  onToast?: (message: string) => void;
+  onCertZonePlaced?: (zone: OverlayItem) => void;
 }
 
 export const PageCanvas: React.FC<PageCanvasProps> = ({
@@ -59,6 +61,8 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
   onDeleteOverlay,
   onYousignZonePlaced,
   onCanvasReady,
+  onToast,
+  onCertZonePlaced,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -155,6 +159,106 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
     const pt = toNormalized(e.clientX, e.clientY);
     const pageIndex = pageNumber - 1;
     const now = new Date().toISOString();
+
+    if (activeTool === 'edit-text') {
+      // Find the text line under the click, then cover it with an editable copy
+      void (async () => {
+        if (!pdfDoc) return;
+        const page = await pdfDoc.getPage(pageNumber);
+        const vp = page.getViewport({ scale: 1 });
+        const content = await page.getTextContent();
+        type Piece = { s: string; left: number; top: number; right: number; bottom: number; size: number; bold: boolean; fontName: string };
+        const pieces: Piece[] = [];
+        for (const it of content.items) {
+          if (!('str' in it) || !it.str.trim()) continue;
+          const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+          const size = Math.hypot(tx[2], tx[3]);
+          const left = tx[4];
+          const bottom = tx[5] + size * 0.22;
+          const fontInfo = content.styles[it.fontName];
+          pieces.push({
+            s: it.str,
+            left,
+            top: tx[5] - size * 0.95,
+            right: left + it.width * vp.scale,
+            bottom,
+            size,
+            bold: /bold|black|heavy/i.test(`${it.fontName} ${fontInfo?.fontFamily ?? ''}`),
+            fontName: it.fontName,
+          });
+        }
+        const px = pt.x * vp.width;
+        const py = pt.y * vp.height;
+        const hit = pieces.find((p) => px >= p.left - 2 && px <= p.right + 2 && py >= p.top - 2 && py <= p.bottom + 2);
+        if (!hit) {
+          onToast?.('Aucun texte à cet endroit. Cliquez directement sur une ligne de texte.');
+          return;
+        }
+        // Whole line = pieces sharing the same baseline
+        const line = pieces
+          .filter((p) => Math.abs(p.bottom - hit.bottom) < hit.size * 0.35)
+          .sort((a, b) => a.left - b.left);
+        let text = '';
+        let end = -Infinity;
+        for (const p of line) {
+          if (text && p.left - end > p.size * 0.2 && !text.endsWith(' ') && !p.s.startsWith(' ')) text += ' ';
+          text += p.s;
+          end = p.right;
+        }
+        const left = Math.min(...line.map((p) => p.left));
+        const right = Math.max(...line.map((p) => p.right));
+        const top = Math.min(...line.map((p) => p.top));
+        const bottom = Math.max(...line.map((p) => p.bottom));
+        // Text colour: the most saturated/dark pixel of the line on the rendered page
+        let color = '#000000';
+        const cv = canvasRef.current;
+        const ctx2 = cv?.getContext('2d', { willReadFrequently: true });
+        if (cv && ctx2) {
+          const sx = cv.width / vp.width;
+          const sy = cv.height / vp.height;
+          const rx = Math.max(0, Math.floor(left * sx));
+          const ry = Math.max(0, Math.floor(top * sy));
+          const rw = Math.max(1, Math.min(cv.width - rx, Math.ceil((right - left) * sx)));
+          const rh = Math.max(1, Math.min(cv.height - ry, Math.ceil((bottom - top) * sy)));
+          try {
+            const data = ctx2.getImageData(rx, ry, rw, rh).data;
+            let best = 0;
+            for (let k = 0; k < data.length; k += 4) {
+              const dist = 765 - (data[k] + data[k + 1] + data[k + 2]);
+              if (dist > best) {
+                best = dist;
+                color = `#${[data[k], data[k + 1], data[k + 2]].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+              }
+            }
+            // Near-black anti-aliasing noise: treat as pure black
+            if (best > 700) color = '#000000';
+          } catch {
+            // canvas not readable: keep black
+          }
+        }
+        const family = content.styles[hit.fontName]?.fontFamily ?? 'sans-serif';
+        const item: OverlayItem = {
+          id: crypto.randomUUID(),
+          pageIndex,
+          kind: 'text',
+          cover: true,
+          x: Math.max(0, left / vp.width - 0.002),
+          y: Math.max(0, top / vp.height - 0.002),
+          w: Math.min(1, (right - left) / vp.width + 0.03),
+          h: Math.min(1, (bottom - top) / vp.height + 0.004),
+          color,
+          fontSize: Math.round(hit.size * 10) / 10,
+          bold: hit.bold,
+          text: text.trim(),
+          origin: { fontSize: Math.round(hit.size * 10) / 10, bold: hit.bold, color },
+          cssFont: `"${hit.fontName}", ${family}`,
+          createdAt: now,
+        };
+        onAddOverlay(item);
+        onSelectOverlay(item.id);
+      })();
+      return;
+    }
 
     if (activeTool === 'text') {
       const item: OverlayItem = {
@@ -290,6 +394,27 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
       };
       onAddOverlay(item);
       onSelectOverlay(item.id);
+      return;
+    }
+
+    if (activeTool === 'cert-zone') {
+      // Visible digital signature: one zone per document (a new one replaces the old)
+      const w = 0.34;
+      const h = 0.09;
+      const item: OverlayItem = {
+        id: crypto.randomUUID(),
+        pageIndex,
+        kind: 'cert-zone',
+        x: Math.max(0, Math.min(1 - w, pt.x - w / 2)),
+        y: Math.max(0, Math.min(1 - h, pt.y - h / 2)),
+        w,
+        h,
+        color: '#1746d1',
+        createdAt: now,
+      };
+      onAddOverlay(item);
+      onSelectOverlay(item.id);
+      onCertZonePlaced?.(item);
       return;
     }
 
@@ -819,8 +944,14 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
                   onChange={(e) => onUpdateOverlay(item.id, { text: e.target.value })}
                   style={{
                     color: item.color,
+                    // Edited line: shown in the document's own font, over the original
+                    // (the page keeps no white box once saved)
+                    background: item.cover ? 'var(--edit-surface, #ffffff)' : undefined,
+                    fontFamily: item.cover && item.cssFont ? item.cssFont : undefined,
+                    padding: item.cover ? '0 0 0 1px' : undefined,
+                    lineHeight: item.cover ? 1.15 : undefined,
                     fontSize: `${(item.fontSize ?? 13) * zoom}px`,
-                    fontWeight: item.bold ? 700 : 400,
+                    fontWeight: item.cover && item.origin && item.bold === item.origin.bold ? undefined : item.bold ? 700 : 400,
                   }}
                 />
               )}
@@ -828,6 +959,13 @@ export const PageCanvas: React.FC<PageCanvasProps> = ({
               {item.kind === 'ocr-layer' && (
                 <div className="overlay-ocr-pill" title="Couche texte OCR invisible injectée à l’export PDF">
                   Couche OCR invisible active ({(item.text || '').length} car.)
+                </div>
+              )}
+
+              {item.kind === 'cert-zone' && (
+                <div className="overlay-cert-zone">
+                  <FileBadge size={14} />
+                  <span>Signature numérique</span>
                 </div>
               )}
 

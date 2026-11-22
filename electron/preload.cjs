@@ -12,6 +12,16 @@ contextBridge.exposeInMainWorld('fDesktop', {
     ipcRenderer.on('file:opened', handler);
     return () => ipcRenderer.removeListener('file:opened', handler);
   },
+  certificates: {
+    choose: () => ipcRenderer.invoke('cert:choose'),
+    inspect: (id, password) => ipcRenderer.invoke('cert:inspect', id, password),
+    create: (req) => ipcRenderer.invoke('cert:create', req),
+    sign: (req) => ipcRenderer.invoke('cert:sign', req),
+  },
+  secureStore: {
+    get: (key) => ipcRenderer.invoke('secure:get', key),
+    set: (key, value) => ipcRenderer.invoke('secure:set', key, value),
+  },
   yousign: {
     getConfig: () => ipcRenderer.invoke('yousign:getConfig'),
     saveConfig: (cfg) => ipcRenderer.invoke('yousign:saveConfig', cfg),

@@ -1699,3 +1699,161 @@ h3,
 .modal-content {
   border-radius: var(--radius);
 }
+
+/* ===== Protection par mot de passe ===== */
+.permissions-fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin: 12px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+
+.permissions-fieldset legend {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 0 4px;
+}
+
+.permissions-fieldset small {
+  flex-basis: 100%;
+  color: var(--text-secondary);
+}
+
+/* ===== Comparaison de documents ===== */
+.compare-body {
+  max-height: 68vh;
+  overflow: auto;
+}
+
+.compare-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.compare-page h3 {
+  font-size: 14px;
+  margin: 14px 0 6px;
+}
+
+.compare-page h3 small {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.compare-lines {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12.5px;
+}
+
+.diff-line {
+  padding: 3px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-bottom: 1px solid var(--border);
+}
+
+.diff-line:last-child {
+  border-bottom: none;
+}
+
+.diff-sign {
+  display: inline-block;
+  width: 14px;
+  font-weight: 700;
+}
+
+.diff-same {
+  color: var(--text-secondary);
+}
+
+.diff-added,
+.diff-added-chip {
+  background: #e6f4ea;
+  color: #14532d;
+}
+
+.diff-removed,
+.diff-removed-chip {
+  background: #fde8f2;
+  color: #9d1a57;
+}
+
+.diff-removed {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.diff-added-chip,
+.diff-removed-chip {
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 12px;
+}
+
+.theme-dark .diff-added,
+.theme-dark .diff-added-chip {
+  background: rgba(74, 222, 128, 0.16);
+  color: #bbf7d0;
+}
+
+.theme-dark .diff-removed,
+.theme-dark .diff-removed-chip {
+  background: rgba(255, 122, 182, 0.16);
+  color: #ffc2dd;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ===== Signature numérique (zone visible) ===== */
+.overlay-cert-zone {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 2px dashed var(--brand-blue);
+  border-radius: 6px;
+  background: rgba(23, 70, 209, 0.08);
+  color: var(--brand-blue);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.cert-info {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--brand-blue);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.cert-info.warning {
+  border-left-color: var(--brand-pink);
+}
+
+.cert-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 4px;
+}

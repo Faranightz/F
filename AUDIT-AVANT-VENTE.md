@@ -50,16 +50,28 @@ Il manque surtout ce qui entoure un produit payant : signature du code, licence,
 6. **Tests automatisés** : aucun test. Au minimum : le moteur PDF (caviardage, formulaires, rotation, fusion) et un test de bout en bout.
 7. **Nom « F-pdf »** : difficile à trouver et à déposer. Vérifier l'INPI avant de vendre. Ajouter l'auteur et le copyright dans `package.json`.
 
-## Reste à faire — fonctionnel (écart avec Foxit)
+## Écarts avec Foxit — comblés le 21/11/2026 (testés)
 
-- **PDF protégés par mot de passe** : non gérés (ouverture impossible).
-- **Caractères non latins** (arabe, chinois, etc.) supprimés à l'export, à cause de la police Helvetica. Il faut intégrer une police Unicode (`@pdf-lib/fontkit`).
-- **Modifier le texte d'origine** du PDF : impossible. F-pdf ajoute seulement des blocs de texte par-dessus. Foxit le fait.
-- **Annotations « aplaties »** : elles sont dessinées dans la page, pas enregistrées comme de vraies annotations PDF. On ne peut donc plus les modifier dans Acrobat ou Foxit.
-- **Pages pivotées** : placement des images et signatures approximatif.
-- **Signatures manuscrites enregistrées en clair** dans le stockage local. Il faudrait les chiffrer (DPAPI), comme la clé Yousign.
-- Conversion vers Word / Excel, comparaison de documents, OCR de tout le document en une fois : absents.
+| Écart | Correction | Preuve de test |
+|---|---|---|
+| PDF protégés par mot de passe | Demande du mot de passe à l'ouverture (3 essais). La protection est conservée à l'enregistrement. Nouveau bouton **Protéger** : chiffrement AES-256, mot de passe propriétaire, droits impression / copie / modification. | Mauvais mot de passe refusé ; bon mot de passe → document ouvert ; PDF chiffré illisible sans mot de passe. |
+| Caractères non latins | Police DejaVu Sans intégrée dès que le texte sort de l'alphabet latin (grec, cyrillique, symboles). Helvetica sinon, pour garder des fichiers légers. | En-tête « Ελληνικά — Кириллица » retrouvé dans le PDF. |
+| Modifier le texte d'origine | Outil **Modifier texte** (onglet Éditer) : la ligne est **réécrite directement dans le contenu de la page**, avec la police, la taille, la couleur et l'espacement du document. Plus aucun cache blanc. Si un caractère manque dans la police intégrée, seul ce caractère passe dans une police de même style (avec ou sans empattement, gras, italique), comme dans Foxit. Polices standard (Helvetica, Times, Arial…) également gérées. | PDF réel sur fond bleu : 0 pixel blanc ; police d'origine conservée ; chiffres absents complétés ; autres lignes à la même position au point près. |
+| Annotations aplaties | Surlignage, formes, stylo, flèches, notes, textes et tampons deviennent de **vraies annotations PDF**, modifiables dans Acrobat ou Foxit. F-pdf les relit et les rend modifiables à la réouverture. Case **Aplatir annotations** pour l'ancien comportement. | 6 annotations reconnues par PDF.js (Highlight, Square, FreeText, Line, Stamp) ; relecture des 6 en éléments modifiables. |
+| Pages pivotées | Images, signatures, textes, notes et tampons placés et orientés correctement à 90°, 180° et 270°. | Signature placée en haut à gauche d'une page pivotée de 90° : pixels rouges au bon endroit. |
+| Signatures en clair | Signatures enregistrées chiffrées par Windows (DPAPI). Les anciennes sont migrées puis effacées du stockage local. | Écriture puis relecture chiffrées OK ; clé inconnue refusée. |
+| Export Word | **Exporter Word** (onglet Convertir & OCR) : paragraphes reconstitués, titres, gras, italique, tailles, couleurs, polices (Arial, Times, Calibri…), alignements, retraits, **tableaux**, **images**, format et marges de page du PDF. | Rapport de test : ouvert dans Word et comparé au PDF, rendu quasi identique (tableau 4×3, image, titres en couleur). |
+| Comparaison | **Comparer** (onglet Organiser) : différences de texte page par page, ajouts en vert et suppressions en rose. | Ligne modifiée détectée sur la bonne page. |
+| Signature par certificat numérique | **Signature certificat** (onglet Formulaire & Signer) : certificat .pfx / .p12, ou **création d'un ID numérique personnel** (RSA 2048, 3 ans). Signature visible placée sur la page (nom, date, motif, lieu) ou invisible. Format PKCS#7 détaché, lu par Acrobat et Foxit. La clé privée reste dans le processus principal d'Electron. Avertissement à l'ouverture d'un PDF déjà signé, et avant de l'enregistrer de nouveau. | Signature vérifiée par OpenSSL (« Verification successful ») ; document modifié d'un octet → « verification failure » ; champ de signature reconnu (Widget/Sig). |
+| OCR du document entier | **OCR document entier** : toutes les pages. Le texte reconnu est placé ligne par ligne, à sa position : le PDF devient recherchable et sélectionnable. | Code testé ; à vérifier sur un vrai scan. |
 
+## Reste à faire — fonctionnel (limites connues)
+
+- **Écritures complexes** : le chinois, le japonais et le coréen ne sont pas couverts par la police. L'arabe et l'hébreu sont écrits sans mise en forme de droite à gauche.
+- **Modifier texte** : ligne par ligne ; ajouter des lignes ne fait pas glisser le paragraphe suivant (pas de refonte de paragraphe). Polices Type 3 ou encodages rares : repli sur un cache blanc + nouvelle police (rare).
+- **Export Word** : les mises en page complexes (colonnes multiples, zones de texte flottantes, tableaux sans alignement net) sont approchées. **Excel** : absent.
+- **Comparaison** : texte seulement (pas les images ni la mise en forme).
+- **Signature par certificat** : horodatage par un serveur (TSA), validation longue durée (PAdES LTV), cartes à puce et magasin de certificats Windows : absents. Un ID personnel prouve l'intégrité, pas l'identité légale (utiliser un certificat d'autorité ou Yousign). Formulaires XFA, PDF/A : absents.
 ## Reste à faire — technique
 
 - `src/App.tsx` fait environ 1 900 lignes : à découper en modules.

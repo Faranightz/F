@@ -7,9 +7,11 @@ import {
   degrees,
   PageSizes,
   PDFName,
+  type PDFFont,
   type PDFForm,
-} from 'pdf-lib';
+} from '@cantoo/pdf-lib';
 import type {
+  BakeOptions,
   HeaderFooterConfig,
   OutlineEntry,
   OverlayItem,
@@ -17,50 +19,26 @@ import type {
   SearchMatch,
   WatermarkConfig,
 } from '../types/pdf';
+import {
+  ANNOTATION_SUBTYPES,
+  OpsPainter,
+  PagePainter,
+  addPdfAnnotation,
+  drawOcrLayer,
+  embedUnicodeFonts,
+  encryptPdf,
+  hexToRgbTuple,
+  makeFrame,
+  paintOverlay,
+  toWinAnsiSafe,
+  visualRectToPdfBox,
+  visualToPdfCoords,
+} from './pdfDraw';
+import { editPageText, standardFallbackFonts, type EditResult } from './contentEdit';
+
+export { toWinAnsiSafe };
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
-
-// Safe WinAnsi encoder: preserves all French/European WinAnsi characters (éèêëàâäîïôöùûüçœŒ€«»’—–…)
-// and replaces unsupported Unicode symbols without crashing pdf-lib.
-const WINANSI_EXTENDED = new Set([
-  0x20ac, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030,
-  0x0160, 0x2039, 0x0152, 0x017d, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
-  0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x017e, 0x0178,
-]);
-
-export function toWinAnsiSafe(input: string): string {
-  const normalized = input
-    .replace(/\ufb01/g, 'fi')
-    .replace(/\ufb02/g, 'fl')
-    .replace(/\u00a0/g, ' ')
-    .replace(/[✓✔]/g, '[v]')
-    .replace(/[✗✘]/g, '[x]')
-    .replace(/→/g, '->')
-    .replace(/←/g, '<-')
-    .replace(/≠/g, '!=')
-    .replace(/≤/g, '<=')
-    .replace(/≥/g, '>=');
-
-  let out = '';
-  for (const ch of normalized) {
-    const cp = ch.codePointAt(0) ?? 32;
-    if (
-      cp === 10 ||
-      cp === 13 ||
-      (cp >= 0x20 && cp <= 0x7e) ||
-      (cp >= 0xa0 && cp <= 0xff) ||
-      WINANSI_EXTENDED.has(cp)
-    ) {
-      out += ch;
-    } else {
-      const stripped = ch.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-      if (stripped && stripped.charCodeAt(0) >= 0x20 && stripped.charCodeAt(0) <= 0x7e) {
-        out += stripped;
-      }
-    }
-  }
-  return out;
-}
 
 const SAFE_IMAGE_DATA_URL_RE = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/=]+)$/;
 
@@ -116,62 +94,6 @@ export async function normalizeImageFileToDataUrl(file: File): Promise<string> {
   } finally {
     URL.revokeObjectURL(objectUrl);
   }
-}
-
-function hexToRgbTuple(hex: string): [number, number, number] {
-  const clean = hex.replace('#', '');
-  const full =
-    clean.length === 3
-      ? clean
-          .split('')
-          .map((c) => c + c)
-          .join('')
-      : clean.padEnd(6, '0');
-  const num = parseInt(full, 16);
-  const r = ((num >> 16) & 255) / 255;
-  const g = ((num >> 8) & 255) / 255;
-  const b = (num & 255) / 255;
-  return [r, g, b];
-}
-
-// Convert normalized visual coordinates (top-left origin 0..1) into raw PDF page coordinates
-// respecting page rotation (0, 90, 180, 270).
-function visualToPdfCoords(
-  nx: number,
-  ny: number,
-  rawW: number,
-  rawH: number,
-  rotDeg: number
-): { x: number; y: number } {
-  const r = ((rotDeg % 360) + 360) % 360;
-  if (r === 90) {
-    return { x: ny * rawW, y: nx * rawH };
-  }
-  if (r === 180) {
-    return { x: (1 - nx) * rawW, y: ny * rawH };
-  }
-  if (r === 270) {
-    return { x: (1 - ny) * rawW, y: (1 - nx) * rawH };
-  }
-  return { x: nx * rawW, y: (1 - ny) * rawH };
-}
-
-function visualRectToPdfBox(
-  nx: number,
-  ny: number,
-  nw: number,
-  nh: number,
-  rawW: number,
-  rawH: number,
-  rotDeg: number
-): { x: number; y: number; w: number; h: number } {
-  const p1 = visualToPdfCoords(nx, ny, rawW, rawH, rotDeg);
-  const p2 = visualToPdfCoords(nx + nw, ny + nh, rawW, rawH, rotDeg);
-  const x = Math.min(p1.x, p2.x);
-  const y = Math.min(p1.y, p2.y);
-  const w = Math.abs(p2.x - p1.x);
-  const h = Math.abs(p2.y - p1.y);
-  return { x, y, w, h };
 }
 
 /**
@@ -464,12 +386,13 @@ export async function createBlankPdf(): Promise<Uint8Array> {
   return pdfDoc.save();
 }
 
-export async function loadPdfWithTask(bytes: Uint8Array): Promise<{
+export async function loadPdfWithTask(bytes: Uint8Array, password?: string): Promise<{
   task: pdfjsLib.PDFDocumentLoadingTask;
   doc: pdfjsLib.PDFDocumentProxy;
 }> {
   const copy = new Uint8Array(bytes);
-  const task = pdfjsLib.getDocument({ data: copy });
+  // fontExtraProperties: keeps the real font names (bold/italic detection, Word export)
+  const task = pdfjsLib.getDocument({ data: copy, fontExtraProperties: true, ...(password ? { password } : {}) });
   const doc = await task.promise;
   return { task, doc };
 }
@@ -568,11 +491,24 @@ export async function bakeEditsToPdf(
   overlays: OverlayItem[],
   watermark: WatermarkConfig,
   headerFooter: HeaderFooterConfig,
-  purgeMetadata = false
+  purgeMetadata = false,
+  options: BakeOptions = { flattenAnnotations: false, security: null }
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(sourceBytes);
-  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const allText = [
+    watermark.enabled ? watermark.text : '',
+    headerFooter.enabled
+      ? [headerFooter.headerLeft, headerFooter.headerRight, headerFooter.footerLeft, headerFooter.footerRight].join(' ')
+      : '',
+    ...overlays.map((o) => `${o.text ?? ''} ${o.stampLabel ?? ''} ${(o.lines ?? []).map((l) => l.text).join(' ')}`),
+  ].join(' ');
+  const fonts = await embedUnicodeFonts(pdfDoc, allText);
+  // Substitute fonts for edited lines whose characters are missing from the original font
+  let unicodeFont: Promise<PDFFont | null> | null = null;
+  const substitutes = standardFallbackFonts(pdfDoc, () => {
+    unicodeFont ??= embedUnicodeFonts(pdfDoc, 'Ж').then((f) => (f.isUnicode ? f.regular : null));
+    return unicodeFont;
+  });
   const form = pdfDoc.getForm();
   const pages = pdfDoc.getPages();
   const totalPages = pages.length;
@@ -594,22 +530,45 @@ export async function bakeEditsToPdf(
     const page = pages[pageIndex];
     const { width, height } = page.getSize();
     const rotDeg = ((page.getRotation().angle % 360) + 360) % 360;
+    const pagePainter = new PagePainter(page, fonts);
+
+    // Edited lines of the original text: rewritten in place in the page content, with the
+    // document's own font (before anything else is drawn on the page)
+    const coverItems = overlays.filter((o) => o.pageIndex === pageIndex && o.kind === 'text' && o.cover);
+    const coverResults = new Map<string, EditResult>();
+    if (coverItems.length) {
+      const results = await editPageText(
+        pdfDoc,
+        page,
+        coverItems.map((o) => {
+          const origin = o.origin ?? { fontSize: o.fontSize ?? 12, bold: !!o.bold, color: o.color };
+          const recoloured = o.color.toLowerCase() !== origin.color.toLowerCase();
+          return {
+            box: visualRectToPdfBox(o.x, o.y, o.w, o.h, width, height, rotDeg),
+            text: o.text ?? '',
+            sizeRatio: (o.fontSize ?? origin.fontSize) / (origin.fontSize || 1),
+            forceBold: !!o.bold !== origin.bold ? !!o.bold : null,
+            color: recoloured ? hexToRgbTuple(o.color) : null,
+          };
+        }),
+        substitutes
+      );
+      coverItems.forEach((o, k) => coverResults.set(o.id, results[k]));
+    }
 
     // 1. Watermark (rotation-aware centering)
     if (watermark.enabled && watermark.text.trim()) {
       const [r, g, b] = hexToRgbTuple(watermark.color);
-      const wmText = toWinAnsiSafe(watermark.text);
+      const wmText = fonts.clean(watermark.text, true);
       const wmSize = watermark.fontSize || 48;
-      const textWidth = helveticaBold.widthOfTextAtSize(wmText, wmSize);
+      const textWidth = fonts.bold.widthOfTextAtSize(wmText, wmSize);
       const totalAngleDeg = (watermark.angle || 45) + rotDeg;
       const rad = (totalAngleDeg * Math.PI) / 180;
-      const cx = width / 2;
-      const cy = height / 2;
       page.drawText(wmText, {
-        x: cx - (textWidth / 2) * Math.cos(rad),
-        y: cy - (textWidth / 2) * Math.sin(rad),
+        x: width / 2 - (textWidth / 2) * Math.cos(rad),
+        y: height / 2 - (textWidth / 2) * Math.sin(rad),
         size: wmSize,
-        font: helveticaBold,
+        font: fonts.bold,
         color: rgb(r, g, b),
         opacity: Math.max(0.05, Math.min(1, watermark.opacity)),
         rotate: degrees(totalAngleDeg),
@@ -619,56 +578,18 @@ export async function bakeEditsToPdf(
     // 2. Header & Footer (rotation-aware)
     if (headerFooter.enabled) {
       const format = (tpl: string) =>
-        toWinAnsiSafe(
-          tpl
-            .replace(/\{page\}/gi, String(pageIndex + 1))
-            .replace(/\{total\}/gi, String(totalPages))
-        );
+        tpl.replace(/\{page\}/gi, String(pageIndex + 1)).replace(/\{total\}/gi, String(totalPages));
       const metaColor = rgb(0.35, 0.38, 0.42);
-      const rotOpt = rotDeg ? { rotate: degrees(rotDeg) } : {};
-      if (headerFooter.headerLeft) {
-        const pt = visualToPdfCoords(0.05, 0.03, width, height, rotDeg);
-        page.drawText(format(headerFooter.headerLeft), {
-          x: pt.x,
-          y: pt.y,
-          size: 9,
-          font: helvetica,
-          color: metaColor,
-          ...rotOpt,
-        });
-      }
-      if (headerFooter.headerRight) {
-        const pt = visualToPdfCoords(0.75, 0.03, width, height, rotDeg);
-        page.drawText(format(headerFooter.headerRight), {
-          x: pt.x,
-          y: pt.y,
-          size: 9,
-          font: helvetica,
-          color: metaColor,
-          ...rotOpt,
-        });
-      }
-      if (headerFooter.footerLeft) {
-        const pt = visualToPdfCoords(0.05, 0.97, width, height, rotDeg);
-        page.drawText(format(headerFooter.footerLeft), {
-          x: pt.x,
-          y: pt.y,
-          size: 9,
-          font: helvetica,
-          color: metaColor,
-          ...rotOpt,
-        });
-      }
-      if (headerFooter.footerRight) {
-        const pt = visualToPdfCoords(0.78, 0.97, width, height, rotDeg);
-        page.drawText(format(headerFooter.footerRight), {
-          x: pt.x,
-          y: pt.y,
-          size: 9,
-          font: helvetica,
-          color: metaColor,
-          ...rotOpt,
-        });
+      const slots: Array<[string, number, number]> = [
+        [headerFooter.headerLeft, 0.05, 0.03],
+        [headerFooter.headerRight, 0.75, 0.03],
+        [headerFooter.footerLeft, 0.05, 0.97],
+        [headerFooter.footerRight, 0.78, 0.97],
+      ];
+      for (const [tpl, nx, ny] of slots) {
+        if (!tpl) continue;
+        const pt = visualToPdfCoords(nx, ny, width, height, rotDeg);
+        pagePainter.text(format(tpl), { x: pt.x, y: pt.y, size: 9, color: metaColor, rotate: rotDeg });
       }
     }
 
@@ -676,203 +597,54 @@ export async function bakeEditsToPdf(
     const pageOverlays = overlays.filter((o) => o.pageIndex === pageIndex);
     for (const item of pageOverlays) {
       // Visual-only Yousign placement guide is not baked into the PDF document
-      if (item.kind === 'yousign-zone') continue;
+      if (item.kind === 'yousign-zone' || item.kind === 'cert-zone') continue;
 
-      const [r, g, b] = hexToRgbTuple(item.color || '#1746d1');
       const box = visualRectToPdfBox(item.x, item.y, item.w, item.h, width, height, rotDeg);
       const { x: px, y: py, w: pw, h: ph } = box;
-      const rotOpt = rotDeg ? { rotate: degrees(rotDeg) } : {};
+      const fr = makeFrame(item, width, height, rotDeg);
 
       if (item.kind === 'redact') {
-        page.drawRectangle({
-          x: px,
-          y: py,
-          width: pw,
-          height: ph,
-          color: rgb(0, 0, 0),
-          opacity: 1,
-        });
-      } else if (item.kind === 'ocr-layer' && item.text) {
-        // Invisible searchable OCR text layer
-        const safeText = toWinAnsiSafe(item.text);
-        const lines = safeText.split('\n');
-        let lineY = py + ph - 10;
-        for (const l of lines) {
-          if (l.trim()) {
-            page.drawText(l, {
-              x: px + 2,
-              y: Math.max(10, lineY),
-              size: 9,
-              font: helvetica,
-              color: rgb(0, 0, 0),
-              opacity: 0,
-              maxWidth: Math.max(40, pw - 4),
-              ...rotOpt,
-            });
-          }
-          lineY -= 12;
-        }
-      } else if (item.kind === 'highlight') {
-        page.drawRectangle({
-          x: px,
-          y: py,
-          width: pw,
-          height: ph,
-          color: rgb(r, g, b),
-          opacity: item.opacity ?? 0.35,
-        });
-      } else if (item.kind === 'rect') {
-        page.drawRectangle({
-          x: px,
-          y: py,
-          width: pw,
-          height: ph,
-          borderColor: rgb(r, g, b),
-          borderWidth: item.strokeWidth ?? 2,
-          opacity: 0,
-        });
-      } else if (item.kind === 'ellipse') {
-        page.drawEllipse({
-          x: px + pw / 2,
-          y: py + ph / 2,
-          xScale: Math.max(1, pw / 2),
-          yScale: Math.max(1, ph / 2),
-          borderColor: rgb(r, g, b),
-          borderWidth: item.strokeWidth ?? 2,
-        });
-      } else if (item.kind === 'draw' && item.points && item.points.length > 1) {
-        for (let i = 1; i < item.points.length; i++) {
-          const p0 = visualToPdfCoords(item.points[i - 1].x, item.points[i - 1].y, width, height, rotDeg);
-          const p1 = visualToPdfCoords(item.points[i].x, item.points[i].y, width, height, rotDeg);
-          page.drawLine({
-            start: p0,
-            end: p1,
-            thickness: item.strokeWidth ?? 2.2,
-            color: rgb(r, g, b),
-          });
-        }
-      } else if (item.kind === 'arrow' && item.points && item.points.length >= 2) {
-        const start = visualToPdfCoords(item.points[0].x, item.points[0].y, width, height, rotDeg);
-        const end = visualToPdfCoords(
-          item.points[item.points.length - 1].x,
-          item.points[item.points.length - 1].y,
-          width,
-          height,
-          rotDeg
-        );
-        page.drawLine({
-          start,
-          end,
-          thickness: item.strokeWidth ?? 2.2,
-          color: rgb(r, g, b),
-        });
-        const angle = Math.atan2(end.y - start.y, end.x - start.x);
-        const headLen = 11;
-        page.drawLine({
-          start: end,
-          end: {
-            x: end.x - headLen * Math.cos(angle - Math.PI / 6),
-            y: end.y - headLen * Math.sin(angle - Math.PI / 6),
-          },
-          thickness: item.strokeWidth ?? 2.2,
-          color: rgb(r, g, b),
-        });
-        page.drawLine({
-          start: end,
-          end: {
-            x: end.x - headLen * Math.cos(angle + Math.PI / 6),
-            y: end.y - headLen * Math.sin(angle + Math.PI / 6),
-          },
-          thickness: item.strokeWidth ?? 2.2,
-          color: rgb(r, g, b),
-        });
-      } else if (item.kind === 'text') {
-        const font = item.bold ? helveticaBold : helvetica;
-        const size = item.fontSize ?? 13;
-        const safeText = toWinAnsiSafe(item.text || '');
-        const textLines = safeText.split('\n');
-        let lineY = py + ph - size;
-        for (const l of textLines) {
-          page.drawText(l, {
-            x: px + 2,
-            y: lineY,
-            size,
-            font,
-            color: rgb(r, g, b),
-            maxWidth: Math.max(40, pw - 4),
-            ...rotOpt,
-          });
-          lineY -= size * 1.3;
-        }
-      } else if (item.kind === 'note') {
-        const noteW = Math.max(pw, 120);
-        const noteH = Math.max(ph, 54);
-        page.drawRectangle({
-          x: px,
-          y: py,
-          width: noteW,
-          height: noteH,
-          color: rgb(1, 0.96, 0.72),
-          borderColor: rgb(0.85, 0.65, 0.1),
-          borderWidth: 1,
-        });
-        page.drawText(toWinAnsiSafe((item.text || 'Note').slice(0, 240)), {
-          x: px + 6,
-          y: py + noteH - 16,
-          size: 9.5,
-          font: helvetica,
-          color: rgb(0.2, 0.16, 0.04),
-          maxWidth: noteW - 12,
-          ...rotOpt,
-        });
-      } else if (item.kind === 'stamp') {
-        const label = toWinAnsiSafe(item.stampLabel || item.text || 'APPROUVÉ');
-        page.drawRectangle({
-          x: px,
-          y: py,
-          width: pw,
-          height: ph,
-          borderColor: rgb(r, g, b),
-          borderWidth: 2.5,
-          color: rgb(r, g, b),
-          opacity: 0.12,
-        });
-        page.drawText(label, {
-          x: px + 10,
-          y: py + ph * 0.34,
-          size: Math.max(11, Math.min(20, ph * 0.45)),
-          font: helveticaBold,
-          color: rgb(r, g, b),
-          ...rotOpt,
-        });
-      } else if (
-        (item.kind === 'image' || item.kind === 'signature') &&
-        item.imageDataUrl
-      ) {
+        page.drawRectangle({ x: px, y: py, width: pw, height: ph, color: rgb(0, 0, 0), opacity: 1 });
+        continue;
+      }
+
+      if (item.kind === 'ocr-layer') {
+        drawOcrLayer(page, fonts, item, width, height, rotDeg);
+        continue;
+      }
+
+      if ((item.kind === 'image' || item.kind === 'signature') && item.imageDataUrl) {
         const decoded = decodeSafeImageDataUrl(item.imageDataUrl);
         if (decoded) {
           const img =
             decoded.format === 'png'
               ? await pdfDoc.embedPng(decoded.bytes)
               : await pdfDoc.embedJpg(decoded.bytes);
-          page.drawImage(img, { x: px, y: py, width: pw, height: ph, ...rotOpt });
+          // Anchor = visual bottom-left corner, drawn rotated so it looks upright
+          const anchor = fr.at(0, fr.h);
+          page.drawImage(img, { x: anchor.x, y: anchor.y, width: fr.w, height: fr.h, rotate: degrees(rotDeg) });
         }
-      } else if (item.kind === 'form-text') {
-        // Native interactive AcroForm text field!
+        continue;
+      }
+
+      if (item.kind === 'form-text') {
         fieldCounter += 1;
         const tf = form.createTextField(uniqueFieldName(form, `f_text_${pageIndex + 1}_${fieldCounter}`));
-        if (item.text) tf.setText(toWinAnsiSafe(item.text));
+        if (item.text) tf.setText(item.text);
         tf.addToPage(page, {
           x: px,
           y: py,
           width: Math.max(30, pw),
           height: Math.max(16, ph),
-          borderColor: rgb(0.2, 0.45, 0.8),
-          backgroundColor: rgb(0.96, 0.98, 1),
+          borderColor: rgb(0.09, 0.275, 0.82),
+          backgroundColor: rgb(0.96, 0.97, 0.99),
           borderWidth: 1,
         });
-      } else if (item.kind === 'form-checkbox') {
-        // Native interactive AcroForm checkbox!
+        if (fonts.isUnicode) tf.updateAppearances(fonts.regular);
+        continue;
+      }
+
+      if (item.kind === 'form-checkbox') {
         fieldCounter += 1;
         const cb = form.createCheckBox(uniqueFieldName(form, `f_check_${pageIndex + 1}_${fieldCounter}`));
         cb.addToPage(page, {
@@ -885,19 +657,59 @@ export async function bakeEditsToPdf(
           borderWidth: 1.2,
         });
         if (item.checked) cb.check();
+        continue;
+      }
+
+      // Edited original text
+      if (item.kind === 'text' && item.cover) {
+        const res = coverResults.get(item.id);
+        if (res?.replaced) continue; // rewritten in place with the document's font
+        // Rare fallback (unusual font): hide the old line, draw the text in a matching font
+        if (!res?.removedAll) {
+          page.drawRectangle({ x: px - 1, y: py - 1, width: pw + 2, height: ph + 2, color: rgb(1, 1, 1) });
+        }
+        const style = res?.style ?? { serif: false, mono: false, bold: !!item.bold, italic: false };
+        const font = (await substitutes.get({ ...style, bold: !!item.bold }, item.text ?? '')) ?? fonts.regular;
+        const size = item.fontSize ?? 12;
+        const [r, g, b] = hexToRgbTuple(item.color || '#000000');
+        (item.text ?? '').split('\n').forEach((l, i) => {
+          const pt = fr.at(0, size * 0.95 + i * size * 1.25);
+          const clean = font === fonts.regular ? fonts.clean(l) : l;
+          try {
+            page.drawText(clean, { x: pt.x, y: pt.y, size, font, color: rgb(r, g, b), rotate: degrees(fr.rot) });
+          } catch {
+            page.drawText(fonts.clean(l), { x: pt.x, y: pt.y, size, font: fonts.regular, color: rgb(r, g, b), rotate: degrees(fr.rot) });
+          }
+        });
+        continue;
+      }
+
+      // Comment-type overlays: real PDF annotations (editable in Acrobat/Foxit) or flattened
+      if (!options.flattenAnnotations && ANNOTATION_SUBTYPES[item.kind]) {
+        const ops = new OpsPainter(fonts);
+        paintOverlay(ops, item, fr, box, width, height, rotDeg);
+        addPdfAnnotation(pdfDoc, page, item, ops, box, width, height, rotDeg);
+      } else {
+        paintOverlay(pagePainter, item, fr, box, width, height, rotDeg);
       }
     }
   }
 
-  const bakedBytes = await pdfDoc.save();
+  let outBytes: Uint8Array = await pdfDoc.save();
 
   // True redaction: a black box alone leaves the hidden text extractable.
   // Pages holding a redaction are flattened to an image so nothing remains underneath.
   const redactedPages = [
     ...new Set(overlays.filter((o) => o.kind === 'redact').map((o) => o.pageIndex)),
   ].filter((i) => i >= 0 && i < totalPages);
-  if (redactedPages.length === 0) return bakedBytes;
-  return flattenPagesToImages(bakedBytes, redactedPages);
+  if (redactedPages.length > 0) {
+    outBytes = await flattenPagesToImages(outBytes, redactedPages);
+  }
+
+  if (options.security && options.security.userPassword) {
+    outBytes = await encryptPdf(outBytes, options.security);
+  }
+  return outBytes;
 }
 
 function uniqueFieldName(form: PDFForm, base: string): string {
@@ -1083,4 +895,52 @@ export function triggerDownload(blob: Blob, filename: string) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/**
+ * Draws the visible part of a digital signature (name, date, reason) in its zone and returns
+ * the zone rectangle in raw PDF coordinates, for the signature widget.
+ */
+export async function drawCertificateAppearance(
+  sourceBytes: Uint8Array,
+  zone: { pageIndex: number; x: number; y: number; w: number; h: number },
+  lines: { name: string; details: string[] }
+): Promise<{ bytes: Uint8Array; rect: [number, number, number, number] }> {
+  const pdfDoc = await PDFDocument.load(sourceBytes);
+  const page = pdfDoc.getPage(Math.min(zone.pageIndex, pdfDoc.getPageCount() - 1));
+  const { width, height } = page.getSize();
+  const rotDeg = ((page.getRotation().angle % 360) + 360) % 360;
+  const fonts = await embedUnicodeFonts(pdfDoc, `${lines.name} ${lines.details.join(' ')}`);
+  const box = visualRectToPdfBox(zone.x, zone.y, zone.w, zone.h, width, height, rotDeg);
+  const fr = makeFrame(zone, width, height, rotDeg);
+  const blue = rgb(0.09, 0.275, 0.82);
+  page.drawRectangle({ x: box.x, y: box.y, width: box.w, height: box.h, color: rgb(0.91, 0.93, 0.99), borderColor: blue, borderWidth: 1 });
+  // Text sized to fit the zone (one line each, never wrapped over the next one)
+  const fit = (text: string, font: PDFFont, wanted: number) =>
+    Math.max(4, Math.min(wanted, (fr.w - 12) / Math.max(1, font.widthOfTextAtSize(text, 1))));
+  const name = fonts.clean(lines.name, true);
+  const nameSize = fit(name, fonts.bold, Math.max(7, Math.min(13, fr.h * 0.24)));
+  const details = lines.details.map((d) => fonts.clean(d));
+  const detailSize = Math.min(...details.map((d) => fit(d, fonts.regular, Math.max(5.5, Math.min(8.5, fr.h * 0.15)))), 8.5);
+  const at = fr.at(6, 4 + nameSize);
+  page.drawText(name, {
+    x: at.x,
+    y: at.y,
+    size: nameSize,
+    font: fonts.bold,
+    color: blue,
+    rotate: degrees(rotDeg),
+  });
+  details.forEach((d, i) => {
+    const p = fr.at(6, 6 + nameSize + (i + 1) * detailSize * 1.3);
+    page.drawText(d, {
+      x: p.x,
+      y: p.y,
+      size: detailSize,
+      font: fonts.regular,
+      color: rgb(0.063, 0.13, 0.227),
+      rotate: degrees(rotDeg),
+    });
+  });
+  return { bytes: await pdfDoc.save(), rect: [box.x, box.y, box.x + box.w, box.y + box.h] };
 }

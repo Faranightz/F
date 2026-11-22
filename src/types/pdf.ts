@@ -22,7 +22,9 @@ export type ActiveTool =
   | 'signature'
   | 'yousign-zone'
   | 'form-text'
-  | 'form-checkbox';
+  | 'form-checkbox'
+  | 'edit-text'
+  | 'cert-zone';
 
 export const TOOL_LABELS_FR: Record<ActiveTool, string> = {
   select: 'Sélection',
@@ -41,6 +43,8 @@ export const TOOL_LABELS_FR: Record<ActiveTool, string> = {
   'yousign-zone': 'Zone Yousign',
   'form-text': 'Champ texte AcroForm',
   'form-checkbox': 'Case AcroForm',
+  'edit-text': 'Modifier le texte existant',
+  'cert-zone': 'Zone de signature numérique',
 };
 
 export type SidebarPanel = 'thumbnails' | 'outline' | 'comments' | 'search';
@@ -76,7 +80,8 @@ export interface OverlayItem {
     | 'yousign-zone'
     | 'ocr-layer'
     | 'form-text'
-    | 'form-checkbox';
+    | 'form-checkbox'
+    | 'cert-zone';
   x: number; // normalized 0..1
   y: number; // normalized 0..1
   w: number; // normalized 0..1
@@ -91,8 +96,33 @@ export interface OverlayItem {
   imageDataUrl?: string; // strictly data:image/(png|jpeg);base64,...
   stampLabel?: StampPreset;
   checked?: boolean; // for form-checkbox
+  cover?: boolean; // text: edit of an existing line of the PDF (rewritten in place on save)
+  origin?: { fontSize: number; bold: boolean; color: string }; // original look of the edited line
+  cssFont?: string; // preview font (the document's own embedded font, loaded by PDF.js)
+  lines?: OcrLine[]; // ocr-layer: recognized lines, positioned
   author?: string;
   createdAt: string;
+}
+
+export interface OcrLine {
+  text: string;
+  x: number; // normalized 0..1
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface PdfSecurity {
+  userPassword: string; // required to open the document
+  ownerPassword: string; // full rights (empty = same as user password)
+  allowPrint: boolean;
+  allowCopy: boolean;
+  allowModify: boolean;
+}
+
+export interface BakeOptions {
+  flattenAnnotations: boolean;
+  security: PdfSecurity | null;
 }
 
 export interface WatermarkConfig {
@@ -138,6 +168,9 @@ export interface PdfTabDocument {
   watermark: WatermarkConfig;
   headerFooter: HeaderFooterConfig;
   outline: OutlineEntry[];
+  flattenAnnotations: boolean; // false = real, editable PDF annotations
+  security: PdfSecurity | null; // password protection applied on save
+  signed?: boolean; // the opened file already holds a digital signature
 }
 
 export interface SavedSignature {
@@ -152,6 +185,31 @@ export interface YousignPlacedZone {
   y: number;
   width: number;
   height: number;
+}
+
+export interface CertificateRef {
+  id: string; // opaque id; the file path stays in the main process
+  fileName: string;
+}
+
+export interface CertificateInfo {
+  name: string;
+  organization: string;
+  email: string;
+  issuer: string;
+  selfSigned: boolean;
+  validFrom: string;
+  validTo: string;
+  valid: boolean;
+}
+
+/** Where the visible certificate signature goes (normalized visual coordinates). */
+export interface CertSignZone {
+  pageIndex: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export interface FDesktopBridge {
@@ -184,6 +242,25 @@ export interface FDesktopBridge {
     send: (req: unknown) => Promise<unknown>;
     status: (record: unknown) => Promise<unknown>;
     download: (record: unknown) => Promise<Uint8Array>;
+  };
+  certificates?: {
+    choose: () => Promise<CertificateRef | null>;
+    inspect: (id: string, password: string) => Promise<CertificateInfo>;
+    create: (req: { name: string; email: string; organization: string; password: string }) => Promise<CertificateRef | null>;
+    sign: (req: {
+      id: string;
+      password: string;
+      pdfBytes: Uint8Array;
+      reason: string;
+      location: string;
+      contact: string;
+      pageIndex: number;
+      rect: [number, number, number, number] | null;
+    }) => Promise<{ bytes: Uint8Array; signerName: string }>;
+  };
+  secureStore?: {
+    get: (key: 'signatures') => Promise<string | null>;
+    set: (key: 'signatures', value: string) => Promise<boolean>;
   };
 }
 

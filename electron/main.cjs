@@ -262,6 +262,91 @@ ipcMain.handle('shell:openExternal', async (event, url) => {
   return false;
 });
 
+// Digital signature with a certificate (.pfx / .p12)
+const signing = require('./signing.cjs');
+
+ipcMain.handle('cert:choose', async (event) => {
+  assertMainSender(event);
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choisir un certificat de signature — F-pdf',
+    filters: [{ name: 'Certificat (PKCS#12)', extensions: ['pfx', 'p12'] }],
+    properties: ['openFile'],
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return signing.rememberCertificate(result.filePaths[0]);
+});
+
+ipcMain.handle('cert:inspect', async (event, id, password) => {
+  assertMainSender(event);
+  return signing.inspectCertificate(String(id), String(password ?? ''));
+});
+
+ipcMain.handle('cert:create', async (event, req) => {
+  assertMainSender(event);
+  const name = String(req?.name ?? '').trim().slice(0, 120);
+  const password = String(req?.password ?? '');
+  if (!name) throw new Error('Le nom est obligatoire.');
+  if (password.length < 6) throw new Error('Le mot de passe doit contenir au moins 6 caractères.');
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: 'Enregistrer mon ID numérique — F-pdf',
+    defaultPath: `${name.replace(/[<>:"/\\|?*]/g, '_')}.pfx`,
+    filters: [{ name: 'Certificat (PKCS#12)', extensions: ['pfx'] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  const p12 = signing.createSelfSignedP12({
+    name,
+    email: String(req?.email ?? '').trim().slice(0, 120),
+    organization: String(req?.organization ?? '').trim().slice(0, 120),
+    password,
+  });
+  await fs.writeFile(result.filePath, p12);
+  return signing.rememberCertificate(result.filePath);
+});
+
+ipcMain.handle('cert:sign', async (event, req) => {
+  assertMainSender(event);
+  if (!(req?.pdfBytes instanceof Uint8Array) || req.pdfBytes.byteLength === 0 || req.pdfBytes.byteLength > MAX_PDF_BYTES) {
+    throw new Error('Document PDF invalide ou trop volumineux.');
+  }
+  return signing.signPdf({
+    id: String(req.id),
+    password: String(req.password ?? ''),
+    pdfBytes: req.pdfBytes,
+    reason: String(req.reason ?? '').slice(0, 200),
+    location: String(req.location ?? '').slice(0, 200),
+    contact: String(req.contact ?? '').slice(0, 200),
+    pageIndex: Number(req.pageIndex) || 0,
+    rect: Array.isArray(req.rect) ? req.rect : null,
+  });
+});
+
+// Small encrypted store (Windows DPAPI) for sensitive user data such as saved signatures
+const SECURE_KEYS = new Set(['signatures']);
+const SECURE_MAX_CHARS = 8 * 1024 * 1024;
+function getSecurePath(key) {
+  return path.join(app.getPath('userData'), `f-${key}.enc`);
+}
+
+ipcMain.handle('secure:get', async (event, key) => {
+  assertMainSender(event);
+  if (!SECURE_KEYS.has(key) || !safeStorage.isEncryptionAvailable()) return null;
+  try {
+    return safeStorage.decryptString(await fs.readFile(getSecurePath(key)));
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle('secure:set', async (event, key, value) => {
+  assertMainSender(event);
+  if (!SECURE_KEYS.has(key) || typeof value !== 'string' || value.length > SECURE_MAX_CHARS) {
+    throw new Error('Données invalides.');
+  }
+  if (!safeStorage.isEncryptionAvailable()) return false;
+  await fs.writeFile(getSecurePath(key), safeStorage.encryptString(value));
+  return true;
+});
+
 // Yousign DPAPI encrypted config + Main-process API v3 proxy
 ipcMain.handle('yousign:getConfig', async (event) => {
   assertMainSender(event);

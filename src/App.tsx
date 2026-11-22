@@ -16,9 +16,15 @@ import {
   FileImage,
   FilePlus2,
   FileText,
+  FileBadge,
+  FileType2,
   FolderOpen,
   FolderPlus,
+  GitCompare,
   Grid,
+  Lock,
+  PencilLine,
+  ScanSearch,
   Hand,
   Highlighter,
   ImagePlus,
@@ -51,7 +57,9 @@ import {
 import {
   TOOL_LABELS_FR,
   type ActiveTool,
+  type OcrLine,
   type OverlayItem,
+  type PdfSecurity,
   type PdfTabDocument,
   type RibbonTab,
   type SavedSignature,
@@ -68,6 +76,7 @@ import {
   duplicatePdfPage,
   extractAllText,
   extractOutline,
+  drawCertificateAppearance,
   extractPdfPages,
   insertBlankPdfPage,
   loadPdfWithTask,
@@ -85,6 +94,37 @@ import { Sidebar } from './components/Sidebar';
 import { OrganizeView } from './components/OrganizeView';
 import { SignatureModal } from './components/SignatureModal';
 import { YousignModal } from './components/YousignModal';
+import { PasswordPromptModal, SecurityModal } from './components/SecurityModals';
+import { CompareModal } from './components/CompareModal';
+import { CertSignModal, type CertSignRequest } from './components/CertSignModal';
+import { decryptPdf, importFpdfAnnotations, isPasswordError } from './utils/pdfDraw';
+import { comparePdfDocuments, type PageComparison } from './utils/pdfTools';
+import { convertPdfToDocx } from './utils/pdfToWord';
+
+/** Recognized text lines of a rendered page, normalized to 0..1 (for the OCR text layer). */
+function ocrLinesFromResult(
+  data: { blocks?: Array<{ paragraphs: Array<{ lines: Array<{ text: string; bbox: { x0: number; y0: number; x1: number; y1: number } }> }> }> | null },
+  width: number,
+  height: number
+): OcrLine[] {
+  const lines: OcrLine[] = [];
+  for (const block of data.blocks ?? []) {
+    for (const para of block.paragraphs) {
+      for (const line of para.lines) {
+        const text = line.text.replace(/\s+/g, ' ').trim();
+        if (!text) continue;
+        lines.push({
+          text,
+          x: line.bbox.x0 / width,
+          y: line.bbox.y0 / height,
+          w: (line.bbox.x1 - line.bbox.x0) / width,
+          h: (line.bbox.y1 - line.bbox.y0) / height,
+        });
+      }
+    }
+  }
+  return lines;
+}
 
 const DEFAULT_WATERMARK = {
   enabled: false,
@@ -116,7 +156,7 @@ const COLOR_PALETTE = [
   '#1746d1',
   '#dc2626',
   '#15803d',
-  '#1d4ed8',
+  '#e83e8c',
   '#111827',
   '#eab308',
 ];
@@ -147,7 +187,10 @@ export default function App() {
 
   const [pendingImageDataUrl, setPendingImageDataUrl] = useState<string | null>(null);
   const [pendingSignatureDataUrl, setPendingSignatureDataUrl] = useState<string | null>(null);
+  // Saved signatures: encrypted by Windows (DPAPI) in the desktop app,
+  // browser storage only in the web preview
   const [savedSignatures, setSavedSignatures] = useState<SavedSignature[]>(() => {
+    if (window.fDesktop?.secureStore) return [];
     try {
       const raw = localStorage.getItem(SAVED_SIG_STORAGE);
       return raw ? (JSON.parse(raw) as SavedSignature[]) : [];
@@ -155,6 +198,54 @@ export default function App() {
       return [];
     }
   });
+  useEffect(() => {
+    const store = window.fDesktop?.secureStore;
+    if (!store) return;
+    let cancelled = false;
+    (async () => {
+      let raw = await store.get('signatures');
+      let legacy: string | null = null;
+      try {
+        legacy = localStorage.getItem(SAVED_SIG_STORAGE);
+      } catch {
+        legacy = null;
+      }
+      if (!raw && legacy) {
+        // Migrate signatures saved in clear by older versions
+        if (await store.set('signatures', legacy)) raw = legacy;
+      }
+      if (raw && legacy) {
+        try {
+          localStorage.removeItem(SAVED_SIG_STORAGE);
+        } catch {
+          // ignore
+        }
+      }
+      if (!cancelled && raw) {
+        try {
+          setSavedSignatures(JSON.parse(raw) as SavedSignature[]);
+        } catch {
+          // corrupted: ignore
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const persistSignatures = useCallback((next: SavedSignature[]) => {
+    const json = JSON.stringify(next);
+    const store = window.fDesktop?.secureStore;
+    if (store) {
+      store.set('signatures', json).catch(() => {});
+      return;
+    }
+    try {
+      localStorage.setItem(SAVED_SIG_STORAGE, json);
+    } catch {
+      // Ignore storage quota exceeded
+    }
+  }, []);
   const [recentFiles, setRecentFiles] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem(RECENT_FILES_STORAGE);
@@ -179,6 +270,32 @@ export default function App() {
   const [ocrProgress, setOcrProgress] = useState(0);
   const [ocrText, setOcrText] = useState('');
   const ocrWorkerRef = useRef<TesseractWorker | null>(null);
+  const [ocrLines, setOcrLines] = useState<OcrLine[]>([]);
+  const ocrCancelRef = useRef(false);
+
+  // Password prompt (protected PDFs), protection settings, comparison
+  const [pwPrompt, setPwPrompt] = useState<{
+    fileName: string;
+    error?: string;
+    resolve: (pw: string | null) => void;
+  } | null>(null);
+  const [securityOpen, setSecurityOpen] = useState(false);
+  const [certModal, setCertModal] = useState<{
+    draft: Partial<CertSignRequest> | null;
+    busy: boolean;
+    error: string | null;
+  } | null>(null);
+  const certDraftRef = useRef<Partial<CertSignRequest> | null>(null);
+  const [compare, setCompare] = useState<{
+    otherName: string;
+    result: PageComparison[] | null;
+    error: string | null;
+  } | null>(null);
+  const askPassword = useCallback(
+    (fileName: string, error?: string) =>
+      new Promise<string | null>((resolve) => setPwPrompt({ fileName, error, resolve })),
+    []
+  );
 
   const [toast, setToast] = useState<string | null>(null);
   const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -228,9 +345,45 @@ export default function App() {
 
   // Open a new tab from PDF bytes with full error handling
   const openBytesInTab = useCallback(
-    async (name: string, bytes: Uint8Array) => {
+    async (name: string, rawBytes: Uint8Array) => {
       try {
-        const { task, doc } = await loadPdfWithTask(bytes);
+        let bytes = rawBytes;
+        let security: PdfSecurity | null = null;
+        let loaded: Awaited<ReturnType<typeof loadPdfWithTask>> | null = null;
+        try {
+          loaded = await loadPdfWithTask(bytes);
+        } catch (err) {
+          if (!isPasswordError(err)) throw err;
+          // Protected PDF: ask for the password (3 tries), then work on a decrypted copy.
+          // The protection is kept and applied again when saving.
+          let error: string | undefined;
+          for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
+            const pw = await askPassword(name, error);
+            if (!pw) return;
+            try {
+              const check = await loadPdfWithTask(rawBytes, pw);
+              await check.task.destroy();
+              bytes = await decryptPdf(rawBytes, pw);
+              loaded = await loadPdfWithTask(bytes);
+              security = { userPassword: pw, ownerPassword: '', allowPrint: true, allowCopy: true, allowModify: true };
+            } catch (pwErr) {
+              if (!isPasswordError(pwErr)) throw pwErr;
+              error = 'Mot de passe incorrect.';
+            }
+          }
+          if (!loaded) {
+            showToast(`Mot de passe incorrect : « ${name} » n’a pas été ouvert.`);
+            return;
+          }
+        }
+        // Annotations written by F-pdf become editable again
+        const imported = await importFpdfAnnotations(bytes);
+        if (imported.overlays.length) {
+          await loaded.task.destroy();
+          bytes = imported.bytes;
+          loaded = await loadPdfWithTask(bytes);
+        }
+        const { task, doc } = loaded;
         const outline = await extractOutline(doc);
         const numPages = doc.numPages;
         await task.destroy();
@@ -244,13 +397,20 @@ export default function App() {
           zoom: 1.15,
           dirty: false,
           purgeMetadata: false,
-          overlays: [],
+          overlays: imported.overlays,
           undoStack: [],
           redoStack: [],
           watermark: { ...DEFAULT_WATERMARK },
           headerFooter: { ...DEFAULT_HEADER_FOOTER },
           outline,
+          flattenAnnotations: false,
+          security,
         };
+        // Already signed? Saving from F-pdf rewrites the file and would break the signature
+        const head = new TextDecoder('latin1').decode(bytes.length > 4_000_000 ? bytes.subarray(bytes.length - 4_000_000) : bytes);
+        tabDoc.signed = /\/ByteRange\s*\[/.test(head) && /\/Type\s*\/Sig\b/.test(head);
+        if (security) showToast(`« ${name} » déverrouillé. La protection sera conservée à l’enregistrement.`);
+        else if (tabDoc.signed) showToast(`« ${name} » contient une signature numérique : l’enregistrer de nouveau l’invalidera.`);
         setTabs((prev) => [...prev, tabDoc]);
         setActiveTabId(id);
         setSelectedOverlayId(null);
@@ -262,7 +422,7 @@ export default function App() {
         );
       }
     },
-    [showToast, recordRecentFile]
+    [showToast, recordRecentFile, askPassword]
   );
 
   // Load initial demo PDF on mount
@@ -416,21 +576,36 @@ export default function App() {
     });
   }, [updateActiveTab]);
 
-  const getBakedPdfBytes = useCallback(async (): Promise<Uint8Array> => {
-    if (!activeTab) throw new Error('Aucun document actif');
-    return bakeEditsToPdf(
-      activeTab.bytes,
-      activeTab.overlays,
-      activeTab.watermark,
-      activeTab.headerFooter,
-      activeTab.purgeMetadata
-    );
-  }, [activeTab]);
+  // `secure`: apply the password protection (only for the saved file: printing, image export
+  // and Yousign need a readable PDF)
+  const getBakedPdfBytes = useCallback(
+    async (secure = false): Promise<Uint8Array> => {
+      if (!activeTab) throw new Error('Aucun document actif');
+      return bakeEditsToPdf(
+        activeTab.bytes,
+        activeTab.overlays,
+        activeTab.watermark,
+        activeTab.headerFooter,
+        activeTab.purgeMetadata,
+        {
+          flattenAnnotations: activeTab.flattenAnnotations,
+          security: secure ? activeTab.security : null,
+        }
+      );
+    },
+    [activeTab]
+  );
 
   const handleSavePdf = useCallback(async () => {
     if (!activeTab) return;
+    if (
+      activeTab.signed &&
+      !window.confirm('Ce document porte une signature numérique. L’enregistrer depuis F-pdf la rendra invalide. Continuer ?')
+    ) {
+      return;
+    }
     try {
-      const outBytes = await getBakedPdfBytes();
+      const outBytes = await getBakedPdfBytes(true);
       if (window.fDesktop?.isElectron) {
         const res = await window.fDesktop.savePdfDialog(activeTab.name, outBytes);
         if (res.saved) {
@@ -786,9 +961,10 @@ export default function App() {
         },
       });
       ocrWorkerRef.current = worker;
-      const { data } = await worker.recognize(canvas);
+      const { data } = await worker.recognize(canvas, {}, { blocks: true });
       await worker.terminate();
       ocrWorkerRef.current = null;
+      setOcrLines(ocrLinesFromResult(data, canvas.width, canvas.height));
       setOcrText(data.text.trim() || '(Aucun texte détecté sur cette page)');
       setOcrProgress(100);
       showToast('Reconnaissance OCR terminée.');
@@ -802,7 +978,209 @@ export default function App() {
     }
   };
 
+  // OCR of every page: adds a positioned, invisible text layer (searchable, selectable PDF)
+  const handleRunOcrAllPages = async () => {
+    if (!pdfProxy || !activeTab) return;
+    const tabId = activeTab.id;
+    const numPages = pdfProxy.numPages;
+    setOcrRunning(true);
+    setOcrProgress(0);
+    setOcrText('');
+    ocrCancelRef.current = false;
+    const layers: OverlayItem[] = [];
+    const texts: string[] = [];
+    try {
+      const worker = await createWorker(ocrLang, 1, {
+        workerPath: new URL('./tesseract/worker.min.js', window.location.href).href,
+        corePath: new URL('./tesseract/tesseract-core-lstm.wasm.js', window.location.href).href,
+        langPath: new URL('./tesseract/lang', window.location.href).href,
+        workerBlobURL: false,
+      });
+      ocrWorkerRef.current = worker;
+      for (let p = 1; p <= numPages && !ocrCancelRef.current; p++) {
+        setOcrText(`Page ${p} / ${numPages}…`);
+        const page = await pdfProxy.getPage(p);
+        const viewport = page.getViewport({ scale: 2 });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) continue;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+        const { data } = await worker.recognize(canvas, {}, { blocks: true });
+        const lines = ocrLinesFromResult(data, canvas.width, canvas.height);
+        texts.push(`--- Page ${p} ---\n${data.text.trim()}`);
+        if (lines.length) {
+          layers.push({
+            id: crypto.randomUUID(),
+            pageIndex: p - 1,
+            kind: 'ocr-layer',
+            x: 0.04,
+            y: 0.04,
+            w: 0.42,
+            h: 0.04,
+            color: '#10213a',
+            lines,
+            text: data.text,
+            createdAt: new Date().toISOString(),
+          });
+        }
+        setOcrProgress(Math.round((p / numPages) * 100));
+      }
+      await worker.terminate();
+      ocrWorkerRef.current = null;
+      if (ocrCancelRef.current) return;
+      setTabs((prev) =>
+        prev.map((t) =>
+          t.id === tabId
+            ? {
+                ...t,
+                dirty: true,
+                undoStack: [...t.undoStack.slice(-29), t.overlays],
+                redoStack: [],
+                // Replace older OCR layers of these pages
+                overlays: [
+                  ...t.overlays.filter(
+                    (o) => !(o.kind === 'ocr-layer' && layers.some((l) => l.pageIndex === o.pageIndex))
+                  ),
+                  ...layers,
+                ],
+              }
+            : t
+        )
+      );
+      setOcrLines([]);
+      setOcrText(texts.join('\n\n'));
+      showToast(`OCR terminé : ${layers.length} page(s) rendue(s) recherchables à l’enregistrement.`);
+    } catch (err) {
+      setOcrText(`Erreur OCR : ${err instanceof Error ? err.message : 'échec de la reconnaissance.'}`);
+    } finally {
+      ocrWorkerRef.current = null;
+      setOcrRunning(false);
+    }
+  };
+
+  const handleExportDocx = async () => {
+    if (!pdfProxy || !activeTab) return;
+    try {
+      showToast('Export Word en cours…');
+      // Convert the document with its edits (annotations, edited text...)
+      const { task, doc } = await loadPdfWithTask(await getBakedPdfBytes());
+      let blob: Blob;
+      try {
+        blob = await convertPdfToDocx(doc);
+      } finally {
+        await task.destroy();
+      }
+      triggerDownload(blob, `${activeTab.name.replace(/\.pdf$/i, '')}.docx`);
+      showToast('Document Word exporté : paragraphes, titres, styles, tableaux et images.');
+    } catch (err) {
+      showToast(err instanceof Error ? `Export Word impossible : ${err.message}` : 'Export Word impossible.');
+    }
+  };
+
+  const handleCompareWith = async (file: File) => {
+    if (!pdfProxy || !activeTab) return;
+    setCompare({ otherName: file.name, result: null, error: null });
+    try {
+      if (file.size > MAX_UPLOAD_BYTES) throw new Error('Le fichier dépasse 100 Mo.');
+      const { task, doc } = await loadPdfWithTask(new Uint8Array(await file.arrayBuffer()));
+      try {
+        const result = await comparePdfDocuments(pdfProxy, doc);
+        setCompare({ otherName: file.name, result, error: null });
+      } finally {
+        await task.destroy();
+      }
+    } catch (err) {
+      setCompare({
+        otherName: file.name,
+        result: null,
+        error: isPasswordError(err)
+          ? 'Ce PDF est protégé : ouvrez-le d’abord dans F-pdf, enregistrez-le sans protection, puis comparez.'
+          : err instanceof Error
+            ? err.message
+            : 'Comparaison impossible.',
+      });
+    }
+  };
+
+  // ----- Digital signature with a certificate -----
+  const cleanIpcError = (e: unknown) =>
+    (e instanceof Error ? e.message : String(e)).replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+
+  const handlePlaceCertZone = (draft: Partial<CertSignRequest>) => {
+    certDraftRef.current = draft;
+    setCertModal(null);
+    setRibbonTab('form');
+    setActiveTool('cert-zone');
+    showToast('Cliquez sur la page à l’endroit où la signature doit apparaître.');
+  };
+
+  const handleCertZonePlaced = (zone: OverlayItem) => {
+    // Only one signature zone: drop the previous ones
+    updateActiveTab((t) => ({
+      ...t,
+      overlays: t.overlays.filter((o) => o.kind !== 'cert-zone' || o.id === zone.id),
+    }));
+    setCertModal({ draft: certDraftRef.current, busy: false, error: null });
+  };
+
+  const handleCertSign = async (req: CertSignRequest) => {
+    const api = window.fDesktop?.certificates;
+    if (!activeTab || !api) return;
+    if (activeTab.security) {
+      setCertModal((m) => m && { ...m, error: 'Retirez d’abord la protection par mot de passe (bouton Protéger) : ce PDF ne peut pas être chiffré et signé en même temps ici.' });
+      return;
+    }
+    setCertModal((m) => m && { ...m, busy: true, error: null, draft: req });
+    try {
+      let bytes = await getBakedPdfBytes(false);
+      let rect: [number, number, number, number] | null = null;
+      let pageIndex = activeTab.currentPage - 1;
+      const zone = activeTab.overlays.filter((o) => o.kind === 'cert-zone').at(-1);
+      if (req.visible && zone) {
+        const now = new Date();
+        const drawn = await drawCertificateAppearance(bytes, zone, {
+          name: `Signé numériquement par ${req.info.name}`,
+          details: [
+            `Date : ${now.toLocaleDateString('fr-FR')} ${now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`,
+            req.reason ? `Motif : ${req.reason}` : '',
+            req.location ? `Lieu : ${req.location}` : '',
+          ].filter(Boolean),
+        });
+        bytes = drawn.bytes;
+        rect = drawn.rect;
+        pageIndex = zone.pageIndex;
+      }
+      const signed = await api.sign({
+        id: req.cert.id,
+        password: req.password,
+        pdfBytes: bytes,
+        reason: req.reason,
+        location: req.location,
+        contact: req.contact,
+        pageIndex,
+        rect,
+      });
+      const fileName = `${activeTab.name.replace(/\.pdf$/i, '')} - signé.pdf`;
+      const saved = await window.fDesktop!.savePdfDialog(fileName, signed.bytes);
+      if (saved.saved) {
+        setCertModal(null);
+        certDraftRef.current = null;
+        updateActiveTab((t) => ({ ...t, overlays: t.overlays.filter((o) => o.kind !== 'cert-zone') }));
+        showToast(`Document signé par ${signed.signerName} et enregistré : ${saved.filePath}. Ne le modifiez plus.`);
+      } else {
+        setCertModal((m) => m && { ...m, busy: false });
+      }
+    } catch (e) {
+      setCertModal((m) => m && { ...m, busy: false, error: `Signature impossible : ${cleanIpcError(e)}` });
+    }
+  };
+
   const handleCloseOcrDrawer = async () => {
+    ocrCancelRef.current = true;
     if (ocrWorkerRef.current) {
       try {
         await ocrWorkerRef.current.terminate();
@@ -822,11 +1200,7 @@ export default function App() {
     setSavedSignatures((prev) => {
       if (prev.some((s) => s.dataUrl === dataUrl)) return prev;
       const next = [{ id: crypto.randomUUID(), label, dataUrl }, ...prev].slice(0, 6);
-      try {
-        localStorage.setItem(SAVED_SIG_STORAGE, JSON.stringify(next));
-      } catch {
-        // Ignore storage quota exceeded
-      }
+      persistSignatures(next);
       return next;
     });
     showToast('Cliquez sur le document pour placer votre signature.');
@@ -835,11 +1209,7 @@ export default function App() {
   const handleDeleteSavedSignature = (id: string) => {
     setSavedSignatures((prev) => {
       const next = prev.filter((s) => s.id !== id);
-      try {
-        localStorage.setItem(SAVED_SIG_STORAGE, JSON.stringify(next));
-      } catch {
-        // Ignore
-      }
+      persistSignatures(next);
       return next;
     });
   };
@@ -1210,6 +1580,15 @@ export default function App() {
                   <Save size={18} />
                   <span>Enregistrer PDF</span>
                 </button>
+                <button
+                  className={`tool-btn ${activeTab?.security ? 'active' : ''}`}
+                  disabled={!hasDoc}
+                  onClick={() => setSecurityOpen(true)}
+                  title="Protéger le PDF par mot de passe (AES-256) et limiter impression, copie, modification"
+                >
+                  <Lock size={18} />
+                  <span>{activeTab?.security ? 'Protégé' : 'Protéger'}</span>
+                </button>
               </div>
             </>
           )}
@@ -1338,6 +1717,18 @@ export default function App() {
                   <span>Ajouter texte</span>
                 </button>
                 <button
+                  className={`tool-btn ${activeTool === 'edit-text' ? 'active' : ''}`}
+                  disabled={!hasDoc}
+                  onClick={() => {
+                    setActiveTool('edit-text');
+                    showToast('Cliquez sur une ligne de texte du PDF pour la modifier.');
+                  }}
+                  title="Modifier une ligne de texte existante du PDF"
+                >
+                  <PencilLine size={18} />
+                  <span>Modifier texte</span>
+                </button>
+                <button
                   className="tool-btn"
                   disabled={!hasDoc}
                   onClick={() => imageInputRef.current?.click()}
@@ -1444,6 +1835,23 @@ export default function App() {
                     />
                     <span>Purger métadonnées</span>
                   </label>
+                  <label
+                    className="ribbon-toggle"
+                    title="Coché : les annotations sont fondues dans la page. Décoché : vraies annotations PDF, modifiables dans Acrobat, Foxit et F-pdf"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={activeTab.flattenAnnotations}
+                      onChange={(e) =>
+                        updateActiveTab((t) => ({
+                          ...t,
+                          dirty: true,
+                          flattenAnnotations: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span>Aplatir annotations</span>
+                  </label>
                 </div>
               )}
             </>
@@ -1495,6 +1903,24 @@ export default function App() {
                   <Scissors size={18} />
                   <span>Extraire page</span>
                 </button>
+                <label
+                  className={`tool-btn ${!hasDoc ? 'disabled' : ''}`}
+                  title="Comparer le texte de ce document avec un autre PDF"
+                >
+                  <GitCompare size={18} />
+                  <span>Comparer</span>
+                  <input
+                    type="file"
+                    accept="application/pdf"
+                    disabled={!hasDoc}
+                    hidden
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) handleCompareWith(f);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
               </div>
               <div className="ribbon-sep" />
               <div className="ribbon-group">
@@ -1561,6 +1987,15 @@ export default function App() {
                   <PenTool size={18} />
                   <span>Signature locale</span>
                 </button>
+                <button
+                  className={`tool-btn ${activeTool === 'cert-zone' ? 'active' : ''}`}
+                  disabled={!hasDoc}
+                  onClick={() => setCertModal({ draft: certDraftRef.current, busy: false, error: null })}
+                  title="Signer avec un certificat numérique (.pfx / .p12), vérifiable dans Acrobat et Foxit"
+                >
+                  <FileBadge size={18} />
+                  <span>Signature certificat</span>
+                </button>
               </div>
               <div className="ribbon-sep" />
               <div className="ribbon-group">
@@ -1623,6 +2058,15 @@ export default function App() {
                   <ScanText size={18} />
                   <span>{ocrRunning ? `OCR ${ocrProgress}%` : 'Lancer OCR page'}</span>
                 </button>
+                <button
+                  className="tool-btn"
+                  onClick={handleRunOcrAllPages}
+                  disabled={!hasDoc || ocrRunning}
+                  title="Reconnaît toutes les pages et rend le PDF recherchable (couche texte invisible)"
+                >
+                  <ScanSearch size={18} />
+                  <span>OCR document entier</span>
+                </button>
               </div>
               <div className="ribbon-sep" />
               <div className="ribbon-group">
@@ -1645,6 +2089,15 @@ export default function App() {
                 <button className="tool-btn" disabled={!hasDoc} onClick={handleExportText}>
                   <FileText size={18} />
                   <span>Tout le texte (.txt)</span>
+                </button>
+                <button
+                  className="tool-btn"
+                  disabled={!hasDoc}
+                  onClick={handleExportDocx}
+                  title="Exporte le texte vers Word (.docx) : paragraphes et titres, sans la mise en page"
+                >
+                  <FileType2 size={18} />
+                  <span>Exporter Word</span>
                 </button>
               </div>
             </>
@@ -1758,6 +2211,8 @@ export default function App() {
                 onDeleteOverlay={handleDeleteOverlay}
                 onYousignZonePlaced={handleYousignZonePlaced}
                 onCanvasReady={handleCanvasReady}
+                onToast={showToast}
+                onCertZonePlaced={handleCertZonePlaced}
               />
             </div>
           )}
@@ -1819,6 +2274,7 @@ export default function App() {
                     h: 0.04,
                     color: '#10213a',
                     text: ocrText,
+                    lines: ocrLines.length ? ocrLines : undefined,
                     createdAt: new Date().toISOString(),
                   });
                   showToast('Couche OCR invisible ajoutée (PDF recherchable à l’export).');
@@ -1852,6 +2308,63 @@ export default function App() {
           </aside>
         )}
       </div>
+
+      {pwPrompt && (
+        <PasswordPromptModal
+          key={`${pwPrompt.fileName}-${pwPrompt.error ?? ''}`}
+          fileName={pwPrompt.fileName}
+          error={pwPrompt.error}
+          onSubmit={(pw) => {
+            pwPrompt.resolve(pw);
+            setPwPrompt(null);
+          }}
+        />
+      )}
+
+      {securityOpen && activeTab && (
+        <SecurityModal
+          current={activeTab.security}
+          onClose={() => setSecurityOpen(false)}
+          onApply={(sec) => {
+            updateActiveTab((t) => ({ ...t, dirty: true, security: sec }));
+            setSecurityOpen(false);
+            showToast(
+              sec
+                ? 'Protection activée : elle sera appliquée à l’enregistrement du PDF.'
+                : 'Protection retirée : le PDF sera enregistré sans mot de passe.'
+            );
+          }}
+        />
+      )}
+
+      {certModal && activeTab && (
+        <CertSignModal
+          initial={certModal.draft}
+          busy={certModal.busy}
+          error={certModal.error}
+          hasZone={activeTab.overlays.some((o) => o.kind === 'cert-zone')}
+          zonePage={(() => {
+            const z = activeTab.overlays.filter((o) => o.kind === 'cert-zone').at(-1);
+            return z ? z.pageIndex + 1 : null;
+          })()}
+          onPlaceZone={handlePlaceCertZone}
+          onSign={handleCertSign}
+          onClose={() => {
+            certDraftRef.current = null;
+            setCertModal(null);
+          }}
+        />
+      )}
+
+      {compare && activeTab && (
+        <CompareModal
+          baseName={activeTab.name}
+          otherName={compare.otherName}
+          result={compare.result}
+          error={compare.error}
+          onClose={() => setCompare(null)}
+        />
+      )}
 
       {/* Bottom Status Bar */}
       <footer className="statusbar">
